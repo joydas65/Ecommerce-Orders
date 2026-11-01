@@ -44,6 +44,20 @@ For local integration testing, use the local database, set `STOREFRONT_ORIGIN=ht
 
 Verify one hosted sandbox payment with test data, then confirm the stored receipt, reload, duplicate-event behavior and foreign-guest denial. Also test returning without paying, cancellation, a delayed webhook and an ambiguous submission response. The query string `checkout=return` is not proof of payment: confirmation requires a fresh server-side Stripe retrieval with matching snapshot values. [Checkout fulfillment](https://docs.stripe.com/checkout/fulfillment), [Webhook signature verification](https://docs.stripe.com/events/manage-webhook-endpoints#signature-errors).
 
+## Merchant authentication and inbox
+
+This read-only feature uses Better Auth inside the existing Node service and PostgreSQL database. It adds no hosted authentication subscription. Apply migrations `003_merchant_orders.sql` and `004_merchant_auth.sql` through the normal checked migration job. They add query indexes and independent auth tables without changing existing checkout records.
+
+1. Register a GitHub OAuth App owned by the merchant. Set its homepage to the exact storefront origin and its authorization callback to `https://<storefront-origin>/api/auth/callback/github`. Local integration needs a separate local callback registration; do not point production login at a loopback URL.
+2. On the **backend production project only**, set `MERCHANT_AUTH_ENABLED=true`, `BETTER_AUTH_URL=https://<storefront-origin>`, a new independent `BETTER_AUTH_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `MERCHANT_GITHUB_IDS`. The allowlist contains immutable numeric GitHub IDs, never emails, display names, client-submitted roles or the first account to sign in. The session secret must differ from `ORDERS_API_SECRET`.
+3. Keep authentication disabled in previews without a separately isolated database and OAuth application. Local HTTP requires explicit `MERCHANT_ALLOW_LOCAL_AUTH=true` and a loopback origin; that exception is rejected on Vercel.
+4. The storefront forwards only approved auth routes and auth cookies to the backend. GitHub OAuth tokens and the session signing secret never belong in storefront variables, browser code or CI. Preserve all `Set-Cookie` values on callbacks and sign-out. `/api/auth/(.*)` uses an unnamed Vercel rewrite so callback state is not polluted by synthetic query parameters.
+5. Release the backward-compatible backend first, then the storefront. Verify authorized sign-in and inbox/detail reads, unauthorized rejection, filters and pagination, sign-out, and guest checkout. Mutation methods return 405. Inspect logs by request ID without logging OAuth codes, state, session cookies or identities.
+
+The merchant routes authenticate a database-backed session independently of the checkout bearer. `/v1/merchant/session` exposes only user ID and role. Permissions are rechecked against the linked immutable GitHub identity on every read; removing an ID from `MERCHANT_GITHUB_IDS` and deploying takes effect even for existing sessions. Revoking a database session immediately denies its cookie. Rotate the signing secret to invalidate all sessions; existing users can sign in again. Invalid auth configuration returns `MERCHANT_UNAVAILABLE` only for merchant/auth operations and does not disable checkout.
+
+The first inbox is deliberately read-only. It does not reconcile payments, fulfill orders, export customer data or override Stripe state. Pending/review records are inspection targets. Operator actions, their audit trail and concurrent-update handling belong to a separate increment.
+
 ## Release sequence
 
 1. On each pull request or main push, `Orders verification` installs locked dependencies, checks syntax, runs tests against an isolated PostgreSQL service, runs release-script tests and audits production dependencies. It has read-only GitHub permissions and no production credentials.
@@ -72,10 +86,12 @@ Then complete the selected checkout flow in the storefront, reload its receipt a
 
 The configured daily cron calls `/internal/cleanup` during the 04:00 UTC hour. Vercel sends `CRON_SECRET` as a bearer token. Cleanup is safe to repeat; reads enforce resolved-receipt expiry independently. Pending and review Stripe records are deliberately retained beyond their nominal expiry and excluded from cleanup, so unresolved payment evidence is not deleted. Inspect and reconcile unresolved attempts; the daily task does not reconcile payments. No automatic resolution deadline is promised. Hobby cron is best effort and failed runs are not automatically retried, so inspect failures before relying on cleanup. `npm run cleanup` offers an authenticated-operator recovery path with the database URL supplied privately. [Cron authentication and behavior](https://vercel.com/docs/cron-jobs/manage-cron-jobs).
 
+The same cleanup also removes expired merchant sessions and OAuth state plus rate-limit counters older than one day; it retains merchant users and linked account identities.
+
 Use request IDs and sanitized status/duration logs to investigate failures. Do not log bearer tokens, database URLs, guest cookies or order request bodies. Free-plan log retention is short; a durable observability pipeline is a future decision rather than an implied feature.
 
 For code rollback, choose the last verified production deployment in Vercel and roll back to that deployment. Check schema compatibility and run the smoke again. Re-enable normal promotion only after checks pass. Restoring database data is separate: Neon Free has a short recovery window and no uptime SLA, so validate a restore procedure before claiming a recovery objective.
 
 When rotating `ORDERS_API_SECRET`, update backend and storefront in a coordinated maintenance window and redeploy both. The current single-secret design does not offer overlapping old/new keys, so temporary checkout failures are possible during rotation. Rotate `CRON_SECRET` separately on the backend.
 
-Stripe support is test-only. No real money movement, fulfillment, stock reservation or refund workflow is configured. Unresolved payment review currently requires investigation rather than an admin UI. These controls do not make the demo a live commerce service. Keep test webhook delivery enabled while unresolved attempts remain; disabling new checkout is different from discarding outstanding payment evidence.
+Stripe support is test-only. No real money movement, fulfillment, stock reservation or refund workflow is configured. The read-only merchant inbox supports investigation of unresolved payments; it cannot change their state. These controls do not make the demo a live commerce service. Keep test webhook delivery enabled while unresolved attempts remain; disabling new checkout is different from discarding outstanding payment evidence.

@@ -55,7 +55,7 @@ function send(response, status, body, requestId) {
 }
 
 // Native IncomingMessage/ServerResponse API shared by Vercel and local HTTP.
-export function createHandler({ service, secret, cronSecret, cleanup, logger = console.info }) {
+export function createHandler({ service, secret, cronSecret, cleanup, merchantOrders, authorizeMerchant, merchantAuth, logger = console.info }) {
   return async function handler(request, response) {
     const started = performance.now();
     const requestId = randomUUID();
@@ -78,6 +78,62 @@ export function createHandler({ service, secret, cronSecret, cleanup, logger = c
       if (request.method === 'POST' && path === '/v1/webhooks/stripe') {
         if (url.search) throw invalid();
         const result = await service.webhook(await rawBody(request, maxWebhookBytes), request.headers['stripe-signature']);
+        status = 200;
+        return send(response, status, result, requestId);
+      }
+      if (path === '/api/auth' || path.startsWith('/api/auth/')) {
+        const methods = { '/api/auth/ok': 'GET', '/api/auth/callback/github': 'GET', '/api/auth/sign-in/social': 'POST', '/api/auth/sign-out': 'POST' };
+        if (!Object.hasOwn(methods, path)) throw new ApiError(404, 'NOT_FOUND', 'This endpoint is unavailable.');
+        if (request.method !== methods[path]) throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'This authentication method is unavailable.');
+        if (typeof merchantAuth !== 'function') throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Merchant sign-in is temporarily unavailable.');
+        const auth = merchantAuth();
+        if (!auth?.origin || typeof auth.handler !== 'function') throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Merchant sign-in is temporarily unavailable.');
+        if (request.url.length > 8192 || (path !== '/api/auth/callback/github' && url.search)) throw invalid();
+        let body;
+        if (request.method === 'POST') {
+          if (request.headers.origin !== auth.origin) throw new ApiError(403, 'AUTH_ORIGIN_INVALID', 'Open merchant sign-in from the storefront.');
+          const input = await jsonBody(request);
+          if (!input || typeof input !== 'object' || Array.isArray(input)) throw invalid();
+          if (path === '/api/auth/sign-in/social') {
+            if (Object.keys(input).sort().join(',') !== 'callbackURL,errorCallbackURL,provider'
+              || input.provider !== 'github' || input.callbackURL !== '/admin/orders' || input.errorCallbackURL !== '/admin/sign-in') throw invalid();
+          } else if (Object.keys(input).length) throw invalid();
+          body = JSON.stringify(input);
+        }
+        const headers = new Headers();
+        for (const name of ['cookie', 'origin', 'content-type', 'user-agent', 'x-forwarded-for']) {
+          if (typeof request.headers[name] === 'string') headers.set(name, request.headers[name]);
+        }
+        const result = await auth.handler(new Request(new URL(request.url, auth.origin), { method: request.method, headers, ...(body === undefined ? {} : { body }) }));
+        status = result.status;
+        response.statusCode = status;
+        response.setHeader('Cache-Control', 'private, no-store');
+        response.setHeader('X-Content-Type-Options', 'nosniff');
+        response.setHeader('X-Request-Id', requestId);
+        for (const name of ['content-type', 'location']) {
+          const value = result.headers.get(name);
+          if (value) response.setHeader(name, value);
+        }
+        const cookies = result.headers.getSetCookie();
+        if (cookies.length) response.setHeader('Set-Cookie', cookies);
+        response.end(Buffer.from(await result.arrayBuffer()));
+        return;
+      }
+      if (path === '/v1/merchant' || path.startsWith('/v1/merchant/')) {
+        if (!merchantOrders || typeof authorizeMerchant !== 'function') throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Merchant orders are temporarily unavailable.');
+        const identity = await authorizeMerchant(request);
+        if (typeof identity?.userId !== 'string' || !identity.userId) throw new ApiError(401, 'AUTH_REQUIRED', 'Sign in to view merchant orders.');
+        if (identity.role !== 'merchant') throw new ApiError(403, 'MERCHANT_FORBIDDEN', 'Merchant access is required.');
+        if (request.method !== 'GET') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Merchant orders are read-only.');
+        let result;
+        if (path === '/v1/merchant/session') {
+          if (url.search) throw invalid();
+          result = { user: { id: identity.userId }, role: 'merchant' };
+        } else if (path === '/v1/merchant/orders') result = await merchantOrders.list(url.searchParams);
+        else if (path.startsWith('/v1/merchant/orders/')) {
+          if (url.search) throw new ApiError(400, 'INVALID_MERCHANT_QUERY', 'Choose a valid payment filter and page.');
+          result = await merchantOrders.read(path.slice('/v1/merchant/orders/'.length));
+        } else throw new ApiError(404, 'NOT_FOUND', 'This endpoint is unavailable.');
         status = 200;
         return send(response, status, result, requestId);
       }

@@ -11,9 +11,10 @@
     "migrate": "node src/migrate.js",
     "cleanup": "node src/cleanup.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
-    "check": "node --check src/api.js && node --check src/database.js && node --check src/service.js && node --check src/stripe-gateway.js && node --check src/runtime.js && node --check api/index.js"
+    "check": "node --check src/api.js && node --check src/database.js && node --check src/service.js && node --check src/stripe-gateway.js && node --check src/runtime.js && node --check api/index.js && node --check src/merchant-auth.js && node --check src/merchant-orders.js"
   },
   "dependencies": {
+    "better-auth": "1.7.15",
     "pg": "8.23.1",
     "stripe": "23.1.0"
   },

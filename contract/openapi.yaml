@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Joy's Store test checkout and persistent orders
-  version: 1.1.0
-  description: Session-owned simulated orders and optional Stripe hosted test checkout. No real money moves and the order API accepts no personal shipping data. Browser callers use the storefront BFF; service routes require bearer authentication and a guest identity. Stripe webhooks instead verify the signature on the raw request body. Query parameters are rejected on authenticated API routes.
+  version: 1.2.0
+  description: Session-owned simulated orders and optional Stripe hosted test checkout. No real money moves and the order API accepts no personal shipping data. Browser callers use the storefront BFF; service routes require bearer authentication and a guest identity. Stripe webhooks instead verify the signature on the raw request body. Guest checkout routes reject query parameters. Read-only merchant routes instead require a valid database-backed session for an explicitly allowed GitHub identity; the checkout bearer cannot authorize merchant access.
 security:
   - serviceBearer: []
 paths:
@@ -205,6 +205,131 @@ paths:
         '413': { $ref: '#/components/responses/Error' }
         '415': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+  /v1/merchant/session:
+    get:
+      operationId: readMerchantSession
+      security: [{ merchantSession: [] }]
+      description: Verifies the signed session cookie, database session expiry, and linked immutable GitHub account ID against the merchant allowlist on every request. Returns no email, session token, or provider credentials.
+      responses:
+        '200':
+          description: Authorized merchant identity. Private no-store.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [user, role]
+                properties:
+                  role: { const: merchant }
+                  user:
+                    type: object
+                    additionalProperties: false
+                    required: [id]
+                    properties:
+                      id: { type: string }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/merchant/orders:
+    get:
+      operationId: listMerchantOrders
+      security: [{ merchantSession: [] }]
+      description: Newest-first live keyset view ordered by (created_at, id), with precise timestamps and a stable unique tie-breaker. A cursor is bound to its filter and does not grant authorization. Refresh to see newer orders. Resolved expired receipts are excluded; unresolved Stripe records remain visible. Unknown or duplicate query parameters fail validation. No mutation is supported.
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [all, paid, pending, canceled, review, simulated], default: all }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 512 }
+      responses:
+        '200':
+          description: Minimal order summaries and the next-page cursor. Private no-store.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantOrderPage' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/merchant/orders/{id}:
+    get:
+      operationId: readMerchantOrder
+      security: [{ merchantSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      description: Explicit receipt-field projection across the store. Excludes guest identity, idempotency keys, raw provider events, checkout URLs and internal payment IDs. The existing guest receipt endpoint retains its separate ownership check.
+      responses:
+        '200':
+          description: Retained order details. Private no-store.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/auth/sign-in/social:
+    post:
+      operationId: startMerchantSignIn
+      security: []
+      description: Starts GitHub OAuth through Better Auth. Origin must exactly match the configured storefront origin. The provider, success destination and error destination are fixed. JSON is bounded to 16 KiB. OAuth state, PKCE, session signing and database-backed rate limits are library-managed.
+      parameters:
+        - name: Origin
+          in: header
+          required: true
+          schema: { type: string, format: uri }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider, callbackURL, errorCallbackURL]
+              properties:
+                provider: { const: github }
+                callbackURL: { const: /admin/orders }
+                errorCallbackURL: { const: /admin/sign-in }
+      responses:
+        '200': { description: GitHub authorization URL and OAuth state cookies from Better Auth. }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '429': { description: Authentication rate limit exceeded. }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/auth/callback/github:
+    get:
+      operationId: finishMerchantSignIn
+      security: []
+      description: GitHub OAuth callback, forwarded by the storefront BFF with OAuth state cookies. Better Auth validates state and provider identity before creating a merchant session. Only allowlisted immutable GitHub account IDs may sign in.
+      responses:
+        '302': { description: Redirect to the fixed storefront success or error page, with applicable state/session cookies. }
+        '400': { $ref: '#/components/responses/Error' }
+        '429': { description: Authentication rate limit exceeded. }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/auth/sign-out:
+    post:
+      operationId: signOutMerchant
+      security: [{ merchantSession: [] }]
+      description: Invalidates the current database session and clears its cookie. Requires the exact storefront Origin and an empty JSON object.
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200': { description: Session cleared. }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/auth/ok:
+    get:
+      operationId: merchantAuthHealth
+      security: []
+      description: Library authentication readiness endpoint. Disabled or invalid configuration fails closed without affecting guest checkout.
+      responses:
+        '200': { description: Authentication handler available. }
+        '503': { $ref: '#/components/responses/Error' }
   /internal/cleanup:
     get:
       operationId: cleanupExpired
@@ -220,6 +345,9 @@ paths:
                 properties:
                   orders: { type: integer, minimum: 0 }
                   quotes: { type: integer, minimum: 0 }
+                  merchantSessions: { type: integer, minimum: 0 }
+                  merchantVerifications: { type: integer, minimum: 0 }
+                  merchantRateLimits: { type: integer, minimum: 0 }
         '401': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
   /health:
@@ -237,6 +365,11 @@ paths:
                   status: { const: ok }
 components:
   securitySchemes:
+    merchantSession:
+      type: apiKey
+      in: cookie
+      name: __Secure-joys_merchant.session_token
+      description: Better Auth signed HttpOnly cookie, validated against the backend database and explicit GitHub-ID allowlist. Local HTTP fixtures use the same name without __Secure-. Neither ORDERS_API_SECRET nor guest cookies grant merchant access.
     serviceBearer:
       type: http
       scheme: bearer
@@ -278,6 +411,37 @@ components:
             additionalProperties: false
             maxProperties: 0
   schemas:
+    MerchantOrderPage:
+      type: object
+      additionalProperties: false
+      required: [orders, pageInfo]
+      properties:
+        orders:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/MerchantOrderSummary' }
+        pageInfo:
+          type: object
+          additionalProperties: false
+          required: [nextCursor, hasMore]
+          properties:
+            nextCursor: { type: [string, 'null'], maxLength: 512 }
+            hasMore: { type: boolean }
+    MerchantOrderSummary:
+      type: object
+      additionalProperties: false
+      required: [id, reference, createdAt, status, paymentStatus, paymentProvider, totalCents, currency, itemCount]
+      properties:
+        id: { type: string, pattern: '^order_[0-9a-f-]{36}$' }
+        reference: { type: string }
+        createdAt: { type: string, format: date-time }
+        status: { type: string, enum: [CONFIRMED, PENDING_PAYMENT, CANCELED, PAYMENT_REVIEW] }
+        paymentStatus: { type: string, enum: [SIMULATED, PAID, PENDING, CANCELED, REQUIRES_REVIEW] }
+        paymentProvider: { type: string, enum: [simulated, stripe-test] }
+        paymentMode: { const: test }
+        totalCents: { type: integer, minimum: 0 }
+        currency: { const: USD }
+        itemCount: { type: integer, minimum: 1, maximum: 594 }
     ProductId:
       type: string
       enum: [demo-desk-mat, demo-notebook, demo-bottle, demo-tote, demo-laptop-stand, demo-desk-lamp]

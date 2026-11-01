@@ -7,7 +7,7 @@ const config = JSON.parse(readFileSync(new URL('../../vercel.json', import.meta.
 
 test('Vercel compiles order routes without adding synthetic query parameters', () => {
   const routes = convertRewrites(config.rewrites);
-  for (const pathname of ['/v1/checkout-quotes', '/v1/orders', '/v1/orders/order_example', '/health', '/internal/cleanup']) {
+  for (const pathname of ['/api/auth/sign-in/social', '/api/auth/callback/github', '/api/auth/sign-out', '/v1/merchant/session', '/v1/merchant/orders', '/v1/merchant/orders/order_example', '/v1/checkout-quotes', '/v1/orders', '/v1/orders/order_example', '/health', '/internal/cleanup']) {
     const route = routes.find(candidate => new RegExp(candidate.src).test(pathname));
     assert.ok(route, `The built routing rules must handle ${pathname}.`);
     const match = pathname.match(new RegExp(route.src));

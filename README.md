@@ -2,7 +2,7 @@
 
 A Node.js 24 order service for the [Joys Store Next.js storefront](https://github.com/joydas65/Ecommerce-Store). The storefront and this separate backend run on Vercel; PostgreSQL on Neon Free stores quotes, orders, payment attempts and webhook deduplication records.
 
-Two checkout paths share authoritative prices and durable receipts: a credential-free simulation and optional Stripe hosted **test** checkout. Stripe support accepts only test keys and test events; it cannot collect real money. Session creation and a successful browser redirect never count as payment confirmation. The service does not store names, email addresses, street addresses or card details; use synthetic information on Stripe's hosted test page.
+Two checkout paths share authoritative prices and durable receipts: a credential-free simulation and optional Stripe hosted **test** checkout. Stripe support accepts only test keys and test events; it cannot collect real money. Session creation and a successful browser redirect never count as payment confirmation. Order records do not store names, email addresses, street addresses or card details; use synthetic information on Stripe's hosted test page.
 
 Read the [API contract](contract/openapi.yaml), [deployment runbook](docs/deployment.md) and [free hosting limits](docs/costs.md).
 
@@ -38,7 +38,7 @@ For optional Stripe testing, follow the runbook's sandbox setup and set the stor
 - Quotes use a versioned server price book, integer cents, shipping and illustrative 8% sample tax. Client price fields are rejected. A quote records its payment provider and cannot cross between simulated and Stripe checkout.
 - A PostgreSQL transaction locks the quote and writes the order plus idempotency record together. The same key and request return the original attempt; conflicting reuse fails. Stripe creation uses a separate stable provider key derived from the durable order, so a lost response can be retried without a second payment session.
 - Stripe orders begin `PENDING_PAYMENT`. Verified signed webhooks and guest-authorized reconciliation retrieve fresh Stripe state, validate the order identity, test mode, currency, exact total and item breakdown, then persist `CONFIRMED/PAID`, `CANCELED/CANCELED` or `PAYMENT_REVIEW/REQUIRES_REVIEW`. Cancellation expires the provider session and rechecks its actual state, including a payment racing with cancellation. Paid state cannot be downgraded by an older event.
-- A return URL proves navigation only. Mismatched provider data and unresolved creation beyond the 23-hour retry window require review instead of another session. There is no background reconciliation worker or operator review console yet.
+- A return URL proves navigation only. Mismatched provider data and unresolved creation beyond the 23-hour retry window require review instead of another session. There is no background reconciliation worker yet. The merchant inbox exposes pending/review records without changing payment state.
 - The server-to-server bearer secret authenticates the storefront. An opaque, HttpOnly guest cookie identifies the browser session; receipt reads also require that guest's ownership. Knowing an order ID alone is insufficient. Signed webhooks use a distinct authentication path.
 - Quotes last 15 minutes. Resolved receipts normally expire after 30 days; payment confirmation starts a fresh 30-day period. Unresolved Stripe pending/review records stay readable and are excluded from cleanup until resolved, preserving recovery evidence. Clearing the guest cookie loses that guest's access; customer accounts and cross-device receipts are outside this step.
 - Remote database connections verify TLS certificates and use a small pool. Durable state lives in PostgreSQL, never function memory or filesystem.
@@ -47,8 +47,20 @@ Backend tests exercise real PostgreSQL transactions, concurrent requests, retrie
 
 Main-only migrations run after verification and are required Vercel Deployment Checks before production promotion. See the runbook for the account settings that activate this gate.
 
+## Private merchant order inbox
+
+The optional inbox adds GitHub sign-in through Better Auth and the same PostgreSQL database. Access is granted only to explicitly allowlisted **immutable numeric GitHub account IDs**. An authenticated ordinary user, a guest cookie, a forged identity header, or the checkout service bearer does not authorize a merchant read. The backend verifies the signed cookie, database session and linked GitHub identity on every request. Merchant sessions expire after eight hours; cookie caching and automatic extension are disabled.
+
+`GET /v1/merchant/session` exposes only the authorized user ID and role. `GET /v1/merchant/orders` returns minimal summaries, payment-status filters (`all`, `paid`, `pending`, `canceled`, `review`, `simulated`) and bounded keyset pagination. `GET /v1/merchant/orders/:id` returns an explicit projection of receipt fields. All responses are private/no-store. The API has no merchant mutation routes. Guest receipt ownership checks remain separate.
+
+Orders sort by descending creation time and unique ID. Cursors preserve PostgreSQL microseconds and are bound to their filter; they do not convey access rights. Newer arrivals appear on refresh without offset-based page shifts. This is a live view, not a snapshot transaction spanning pages. Completed expired receipts stay hidden; unresolved Stripe records remain available.
+
+Authentication has separate tables for merchant profiles, linked GitHub accounts, sessions, OAuth state and rate limits. Merchant profile names/emails and encrypted OAuth credentials are authentication data, never copied into order receipts or merchant API responses. The daily cleanup removes expired sessions and OAuth state plus rate-limit counters older than a day; it retains stable merchant identities. The fixed storefront origin and strict sign-in destinations prevent request headers from selecting OAuth return locations. Password signup and automatic account linking are disabled.
+
+See the [merchant setup and recovery runbook](docs/deployment.md#merchant-authentication-and-inbox). Disabling or misconfiguring this optional feature leaves guest checkout available and merchant reads closed.
+
 ## Deliberate tradeoffs
 
 Two repositories expose a clear API and deployment boundary, with extra coordination when the contract changes. Node keeps setup small; PostgreSQL transactions and constraints make concurrency explicit. Stripe's external side effect cannot participate in the database transaction, so durable attempt identity, provider idempotency, fresh retrieval and review states handle uncertainty.
 
-Free plans can pause at quotas and wake from idle. This is a personal portfolio demonstration, without commercial uptime promises. Shared service authentication requires coordinated rotation. Real commerce would still need inventory reservation, authenticated customers, real tax and shipping rules, fulfillment, refunds, monitoring and audited operations. Enabling live payments requires a separate design and hosting review; replacing a test key is deliberately rejected.
+Free plans can pause at quotas and wake from idle. This is a personal portfolio demonstration, without commercial uptime promises. Shared service authentication requires coordinated rotation. Real commerce would still need inventory reservation, authenticated customer accounts, real tax and shipping rules, fulfillment, refunds, monitoring and audited operations. Enabling live payments requires a separate design and hosting review; replacing a test key is deliberately rejected.

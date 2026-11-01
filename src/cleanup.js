@@ -9,7 +9,13 @@ export async function cleanupExpired(pool, now = new Date()) {
     // receipt is live; remove unconsumed expired quotes and old receipt quotes.
     const candidates = await client.query('SELECT id FROM checkout_quotes WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED', [now]);
     const quotes = await client.query('DELETE FROM checkout_quotes q WHERE q.id = ANY($1::text[]) AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.quote_id = q.id)', [candidates.rows.map((row) => row.id)]);
-    return { orders: orders.rowCount, quotes: quotes.rowCount };
+    // Authentication state has its own lifetime; keep stable merchant users and
+    // account identities while removing expired sessions and OAuth state.
+    const sessions = await client.query('DELETE FROM merchant_sessions WHERE "expiresAt" <= $1', [now]);
+    const verifications = await client.query('DELETE FROM merchant_verifications WHERE "expiresAt" <= $1', [now]);
+    const rateLimits = await client.query('DELETE FROM merchant_rate_limits WHERE "lastRequest" <= $1', [now.getTime() - 86400000]);
+    return { orders: orders.rowCount, quotes: quotes.rowCount,
+      merchantSessions: sessions.rowCount, merchantVerifications: verifications.rowCount, merchantRateLimits: rateLimits.rowCount };
   });
 }
 

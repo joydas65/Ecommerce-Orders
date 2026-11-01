@@ -2,6 +2,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { ApiError, invalid } from './errors.js';
 
 export const maxBodyBytes = 16384;
+export const maxWebhookBytes = 262144;
 const digest = (value) => createHash('sha256').update(value).digest();
 
 export function validApiSecret(secret) {
@@ -14,11 +15,11 @@ function authorized(header, secret) {
   return timingSafeEqual(digest(header), digest(`Bearer ${secret}`));
 }
 
-async function jsonBody(request) {
+async function rawBody(request, limit = maxBodyBytes) {
   const type = request.headers['content-type'];
   if (typeof type !== 'string' || type.split(';')[0].trim().toLowerCase() !== 'application/json') throw new ApiError(415, 'JSON_REQUIRED', 'Send a JSON request.');
   const size = Number(request.headers['content-length']);
-  if (Number.isFinite(size) && size > maxBodyBytes) throw new ApiError(413, 'REQUEST_TOO_LARGE', 'The request is too large.');
+  if (Number.isFinite(size) && size > limit) throw new ApiError(413, 'REQUEST_TOO_LARGE', 'The request is too large.');
   const body = await new Promise((resolve, reject) => {
     const chunks = [];
     let bytes = 0;
@@ -27,7 +28,7 @@ async function jsonBody(request) {
       if (rejected) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += buffer.byteLength;
-      if (bytes > maxBodyBytes) {
+      if (bytes > limit) {
         rejected = true;
         reject(new ApiError(413, 'REQUEST_TOO_LARGE', 'The request is too large.'));
         // Keep draining without retaining bytes so the 413 can reach the caller.
@@ -39,6 +40,11 @@ async function jsonBody(request) {
     request.once('error', reject);
     request.once('aborted', () => reject(invalid()));
   });
+  return body;
+}
+
+async function jsonBody(request) {
+  const body = await rawBody(request);
   try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(body)); }
   catch { throw invalid(); }
 }
@@ -69,6 +75,12 @@ export function createHandler({ service, secret, cronSecret, cleanup, logger = c
         status = 200;
         return send(response, status, counts, requestId);
       }
+      if (request.method === 'POST' && path === '/v1/webhooks/stripe') {
+        if (url.search) throw invalid();
+        const result = await service.webhook(await rawBody(request, maxWebhookBytes), request.headers['stripe-signature']);
+        status = 200;
+        return send(response, status, result, requestId);
+      }
       if (!authorized(request.headers.authorization, secret)) throw new ApiError(401, 'UNAUTHORIZED', 'Service authentication is required.');
       if (url.search) throw invalid();
       const guest = request.headers['x-guest-id'];
@@ -80,6 +92,17 @@ export function createHandler({ service, secret, cronSecret, cleanup, logger = c
         const result = await service.createOrder(guest, await jsonBody(request), request.headers['idempotency-key']);
         status = result.replayed ? 200 : 201;
         send(response, status, result.order, requestId);
+      } else if (request.method === 'POST' && path === '/v1/payment-sessions') {
+        const result = await service.createPaymentSession(guest, await jsonBody(request), request.headers['idempotency-key']);
+        status = result.replayed ? 200 : 201;
+        send(response, status, { order: result.order, checkoutUrl: result.checkoutUrl }, requestId);
+      } else if (request.method === 'POST' && /^\/v1\/orders\/[^/]+\/(reconcile|cancel)$/.test(path)) {
+        const body = await jsonBody(request);
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) throw invalid();
+        const [, , , id, action] = path.split('/');
+        const result = await (action === 'cancel' ? service.cancelOrder(guest, id) : service.reconcileOrder(guest, id));
+        status = 200;
+        send(response, status, result, requestId);
       } else if (request.method === 'GET' && path.startsWith('/v1/orders/')) {
         const order = await service.readOrder(guest, path.slice('/v1/orders/'.length));
         status = 200;

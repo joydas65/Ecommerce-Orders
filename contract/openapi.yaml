@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Joy's Store persistent demo orders
-  version: 1.0.0
-  description: Synthetic, session-owned receipts. No payment is collected and no personal shipping data is accepted. The deployed API requires a server-to-server bearer secret; browser callers use the storefront's same-origin server routes.
+  title: Joy's Store test checkout and persistent orders
+  version: 1.1.0
+  description: Session-owned simulated orders and optional Stripe hosted test checkout. No real money moves and the order API accepts no personal shipping data. Browser callers use the storefront BFF; service routes require bearer authentication and a guest identity. Stripe webhooks instead verify the signature on the raw request body. Query parameters are rejected on authenticated API routes.
 security:
   - serviceBearer: []
 paths:
@@ -31,6 +31,7 @@ paths:
                     properties:
                       productId: { $ref: '#/components/schemas/ProductId' }
                       quantity: { type: integer, minimum: 1, maximum: 99 }
+                paymentProvider: { type: string, enum: [simulated, stripe-test], default: simulated }
                 shippingMethod: { $ref: '#/components/schemas/ShippingMethod' }
                 destination:
                   type: object
@@ -55,6 +56,7 @@ paths:
   /v1/orders:
     post:
       operationId: placeOrder
+      description: Confirms only simulated quotes. Stripe quotes must use payment-sessions; payment providers cannot be mixed.
       parameters:
         - $ref: '#/components/parameters/Guest'
         - name: Idempotency-Key
@@ -100,7 +102,7 @@ paths:
           schema: { type: string, pattern: '^order_[0-9a-f-]{36}$' }
       responses:
         '200':
-          description: The authenticated guest's receipt. No-store; unavailable after thirty days.
+          description: The authenticated guest's receipt. Private no-store. Resolved receipts normally expire after thirty days; Stripe confirmation starts a fresh thirty-day period. Pending/review Stripe receipts remain readable until resolved.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Order' }
@@ -111,6 +113,98 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503': { $ref: '#/components/responses/Error' }
+  /v1/payment-sessions:
+    post:
+      operationId: createPaymentSession
+      description: Durably creates or replays a Stripe test order and hosted checkout session. Creation and browser return do not confirm payment. Retain the same idempotency key and quote across ambiguous failures; do not start another attempt. Only stripe-test quotes are accepted.
+      parameters:
+        - $ref: '#/components/parameters/Guest'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteReference' }
+      responses:
+        '201':
+          description: New durable attempt; normally pending payment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentSession' }
+        '200':
+          description: Original attempt replayed. The current order state may already be resolved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentSession' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '410': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/orders/{id}/reconcile:
+    post:
+      operationId: reconcilePayment
+      description: Retrieves current Stripe test session state and validates identity, totals and items against the persisted snapshot. Uncertain or mismatched state never confirms payment.
+      parameters:
+        - $ref: '#/components/parameters/Guest'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200': { $ref: '#/components/responses/PaymentSession' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/orders/{id}/cancel:
+    post:
+      operationId: cancelPayment
+      description: Expires an unpaid Stripe test session then retrieves and validates its actual state. A payment racing with cancellation may return CONFIRMED/PAID; the requested action does not guarantee cancellation.
+      parameters:
+        - $ref: '#/components/parameters/Guest'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200': { $ref: '#/components/responses/PaymentSession' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/webhooks/stripe:
+    post:
+      operationId: receiveStripeWebhook
+      description: Verifies the signature on the untouched raw JSON body (maximum 262144 bytes), rejects live-mode events, and retrieves fresh provider state before applying supported checkout.session events. Durable event deduplication and monotonic paid state tolerate retries and reordered delivery. No service bearer or guest header is required.
+      security:
+        - stripeSignature: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Stripe snapshot event signed for this endpoint; checkout.session.completed, async_payment_succeeded, async_payment_failed and expired are handled. Other valid signed test event types are acknowledged without a transition.
+      responses:
+        '200':
+          description: Event handled or safely ignored. Acknowledgment alone does not assert a paid order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [received]
+                properties:
+                  received: { const: true }
+        '400': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
   /internal/cleanup:
     get:
       operationId: cleanupExpired
@@ -118,7 +212,7 @@ paths:
         - cleanupBearer: []
       responses:
         '200':
-          description: Expired receipts, replay records and unconsumed quotes removed; returns aggregate counts only.
+          description: Eligible expired receipts, replay records and unconsumed quotes removed; unresolved Stripe pending/review records are retained. Returns aggregate counts only; does not reconcile payments.
           content:
             application/json:
               schema:
@@ -147,6 +241,11 @@ components:
       type: http
       scheme: bearer
       description: ORDERS_API_SECRET of at least 32 printable non-space characters, stored only on the storefront and orders servers. The guest header is trusted only from this authenticated server-to-server caller.
+    stripeSignature:
+      type: apiKey
+      in: header
+      name: Stripe-Signature
+      description: Stripe signature verified against STRIPE_WEBHOOK_SECRET using the exact raw request bytes and timestamp tolerance.
     cleanupBearer:
       type: http
       scheme: bearer
@@ -158,6 +257,26 @@ components:
       required: true
       description: UUID guest identity supplied by the trusted storefront server from its opaque, HttpOnly guest cookie. Never accept a browser-supplied guest header in the storefront proxy.
       schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Generate once per attempt; retain across ambiguous failures and reloads. Reuse with a different quote is rejected.
+      schema: { type: string, format: uuid }
+    OrderId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^order_[0-9a-f-]{36}$' }
+  requestBodies:
+    EmptyObject:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            maxProperties: 0
   schemas:
     ProductId:
       type: string
@@ -194,8 +313,9 @@ components:
       allOf:
         - $ref: '#/components/schemas/Totals'
         - type: object
-          required: [id, expiresAt]
+          required: [id, expiresAt, paymentProvider]
           properties:
+            paymentProvider: { type: string, enum: [simulated, stripe-test] }
             id: { type: string, pattern: '^quote_[0-9a-f-]{36}$' }
             expiresAt: { type: string, format: date-time }
     Order:
@@ -205,12 +325,65 @@ components:
           required: [id, reference, quoteId, status, paymentStatus, createdAt, expiresAt]
           properties:
             id: { type: string, pattern: '^order_[0-9a-f-]{36}$' }
-            reference: { type: string, pattern: '^DEMO-' }
+            reference: { type: string }
             quoteId: { type: string, pattern: '^quote_[0-9a-f-]{36}$' }
-            status: { const: CONFIRMED }
-            paymentStatus: { const: SIMULATED }
+            status: { type: string }
+            paymentStatus: { type: string }
+            paymentProvider: { type: string, enum: [simulated, stripe-test] }
+            paymentMode: { const: test }
             createdAt: { type: string, format: date-time }
             expiresAt: { type: string, format: date-time }
+        - oneOf:
+            - type: object
+              properties:
+                reference: { type: string, pattern: '^DEMO-' }
+                status: { const: CONFIRMED }
+                paymentStatus: { const: SIMULATED }
+                paymentProvider: { const: simulated }
+              not:
+                required: [paymentMode]
+              description: Legacy simulated receipts may omit paymentProvider.
+            - type: object
+              required: [paymentProvider, paymentMode]
+              properties:
+                reference: { type: string, pattern: '^TEST-' }
+                paymentProvider: { const: stripe-test }
+                paymentMode: { const: test }
+              oneOf:
+                - properties:
+                    status: { const: PENDING_PAYMENT }
+                    paymentStatus: { const: PENDING }
+                - properties:
+                    status: { const: CONFIRMED }
+                    paymentStatus: { const: PAID }
+                - properties:
+                    status: { const: CANCELED }
+                    paymentStatus: { const: CANCELED }
+                - properties:
+                    status: { const: PAYMENT_REVIEW }
+                    paymentStatus: { const: REQUIRES_REVIEW }
+    QuoteReference:
+      type: object
+      additionalProperties: false
+      required: [quoteId]
+      properties:
+        quoteId: { type: string, pattern: '^quote_[0-9a-f-]{36}$' }
+    PaymentSession:
+      type: object
+      required: [order, checkoutUrl]
+      properties:
+        order:
+          allOf:
+            - $ref: '#/components/schemas/Order'
+            - type: object
+              required: [paymentProvider, paymentMode]
+              properties:
+                paymentProvider: { const: stripe-test }
+                paymentMode: { const: test }
+        checkoutUrl:
+          type: [string, 'null']
+          pattern: '^https://checkout\.stripe\.com/'
+          description: Resumable hosted URL only for an open pending session; otherwise null. Its presence is not proof of payment.
     Error:
       type: object
       required: [error]
@@ -222,6 +395,11 @@ components:
             code: { type: string }
             message: { type: string }
   responses:
+    PaymentSession:
+      description: Current persisted Stripe test order and a resumable hosted URL when available.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/PaymentSession' }
     Error:
       description: Structured safe failure. An ambiguous 503 must retain the original submission key for retry.
       content:

@@ -2,6 +2,7 @@ import { createHandler } from './api.js';
 import { createPool } from './database.js';
 import { OrderService } from './service.js';
 import { cleanupExpired } from './cleanup.js';
+import { stripeGatewayFromEnv } from './stripe-gateway.js';
 
 let runtime;
 export function runtimeHandler(request, response) {
@@ -10,7 +11,7 @@ export function runtimeHandler(request, response) {
   if (!runtime) {
     try {
       const pool = createPool();
-      runtime = createHandler({ service: new OrderService(pool), secret: process.env.ORDERS_API_SECRET, cronSecret: process.env.CRON_SECRET, cleanup: () => cleanupExpired(pool) });
+      runtime = createHandler({ service: new OrderService(pool, { stripeGateway: stripeGatewayFromEnv() }), secret: process.env.ORDERS_API_SECRET, cronSecret: process.env.CRON_SECRET, cleanup: () => cleanupExpired(pool) });
     } catch {
       response.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store' });
       response.end(JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Orders are temporarily unavailable.' } }));

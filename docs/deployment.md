@@ -19,15 +19,30 @@ For the first release, an authenticated operator may run `npm run migrate` once 
 After the backend checks and first live smoke succeed, set the storefront's production variables:
 
 ```dotenv
-NEXT_PUBLIC_COMMERCE_MODE=demo
-NEXT_PUBLIC_DEMO_ORDER_STORAGE=remote
+NEXT_PUBLIC_CATALOG_PROVIDER=seeded
+NEXT_PUBLIC_PAYMENT_PROVIDER=simulated
+NEXT_PUBLIC_ORDER_STORAGE=remote
 ORDERS_API_URL=https://<verified-orders-production-domain>
 ORDERS_API_SECRET=<same backend service secret>
 ```
 
-Redeploy the storefront because the demo-storage switch is a build-time value. Keep previews in local demo mode. Backend previews intentionally have no production database or service secret, and authenticated order operations fail closed. A future functional preview environment needs its own database and its own secrets.
+Redeploy the storefront because public capabilities are build-time values. Keep previews on seeded catalog, simulated payments and local order storage. Backend previews intentionally have no production database or service secret, and authenticated order operations fail closed. A future functional preview environment needs its own database and its own secrets.
 
-The backend production domain must be accessible to the storefront server. Keep the application's bearer authentication enabled even if Vercel deployment protection is changed. Anonymous callers may read `/health`; quote/order/receipt routes require `ORDERS_API_SECRET`, and `/internal/cleanup` requires the separate `CRON_SECRET`.
+The backend production domain must be accessible to the storefront server. Keep the application's bearer authentication enabled even if Vercel deployment protection is changed. Anonymous callers may read `/health`; quote/order/receipt routes require `ORDERS_API_SECRET`, and `/internal/cleanup` requires the separate `CRON_SECRET`. Stripe webhooks authenticate the untouched raw body using their own endpoint signing secret.
+
+## Optional Stripe sandbox setup
+
+The default profile remains simulated until a separate, tested activation. The following config enables **test-only** hosted payments; it does not make the store a live commerce service. Stripe test transactions do not move funds. Use synthetic customer details and Stripe's documented test cards, never real card details. [Stripe testing](https://docs.stripe.com/testing).
+
+1. Use one Stripe sandbox throughout. Keep its `sk_test_...` key server-only on the orders backend. The runtime rejects live keys. There is no custom provider-host setting in production.
+2. Configure a snapshot-event webhook for `https://<verified-orders-production-domain>/v1/webhooks/stripe`, using API version `2026-10-28.endive`. Subscribe to `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed` and `checkout.session.expired`. Save that endpoint's `whsec_...` signing secret on the backend only. Do not use a CLI listener's signing secret for a deployed endpoint.
+3. Set backend production `STRIPE_PAYMENTS_ENABLED=true`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` and `STOREFRONT_ORIGIN=https://<verified-storefront-production-domain>` only as part of the reviewed activation. Keep `NODEJS_HELPERS=0` before building. The origin must be fixed, with no path, credentials, query or fragment; request headers cannot choose a payment return destination.
+4. Apply the additive payment migration and verify the backend before switching the storefront to `NEXT_PUBLIC_CATALOG_PROVIDER=seeded`, `NEXT_PUBLIC_PAYMENT_PROVIDER=stripe`, `NEXT_PUBLIC_ORDER_STORAGE=remote`. Both backend and storefront require new builds for their configuration. Keep database and payment secrets out of previews and GitHub jobs.
+5. For the storefront deployment gate, set the repository variable `PAYMENT_PROVIDER=stripe` only when activating that production profile. With the variable absent, the gate still expects simulated checkout. Previews remain simulated regardless of this variable. Use a fresh commit when changing release configuration so old checks from the same commit cannot satisfy the new profile accidentally.
+
+For local integration testing, use the local database, set `STOREFRONT_ORIGIN=http://127.0.0.1:3000`, and opt in with `ORDERS_ALLOW_LOCAL_STOREFRONT=true`. This HTTP exception is rejected on Vercel. A Stripe CLI listener can forward the four subscribed events to `http://127.0.0.1:4100/v1/webhooks/stripe`; use the listener's signing secret for that local process only. Load credentials through a private environment, never a committed file or command argument.
+
+Verify one hosted sandbox payment with test data, then confirm the stored receipt, reload, duplicate-event behavior and foreign-guest denial. Also test returning without paying, cancellation, a delayed webhook and an ambiguous submission response. The query string `checkout=return` is not proof of payment: confirmation requires a fresh server-side Stripe retrieval with matching snapshot values. [Checkout fulfillment](https://docs.stripe.com/checkout/fulfillment), [Webhook signature verification](https://docs.stripe.com/events/manage-webhook-endpoints#signature-errors).
 
 ## Release sequence
 
@@ -47,13 +62,15 @@ Supply `ORDERS_API_SECRET` through an existing protected environment. Set `ORDER
 node scripts/release/verify-production.mjs
 ```
 
-The script rejects an unexpected host, credentials in the URL and automatic redirects. It verifies unauthenticated rejection, price/shipping, order persistence, idempotent replay, receipt loading and another guest's access denial. It prints no credentials, request bodies or guest IDs and creates only a synthetic demo receipt. It deliberately fails on a deployment-protection login page.
+This smoke verifies the simulated path, including when optional Stripe support is enabled. It does not prove Stripe payment integration. The script rejects an unexpected host, credentials in the URL and automatic redirects. It verifies unauthenticated rejection, price/shipping, order persistence, idempotent replay, receipt loading and another guest's access denial. It prints no credentials, request bodies or guest IDs and creates only a synthetic demo receipt. It deliberately fails on a deployment-protection login page.
 
-Then complete a purchase in the storefront, reload its receipt and open the same receipt URL in a separate browser session. Confirm the receipt survives a backend redeploy and the second session cannot access it. A backend failure must preserve the cart and must not display a success confirmation.
+The storefront Stripe production gate, when configured, creates one unpaid test session per test attempt, verifies its private pending receipt and cancels it. It never enters a card or claims payment completion. Local Stripe browser contract tests intercept the BFF and hosted page; those deterministic fixtures do not contact Stripe or PostgreSQL.
+
+Then complete the selected checkout flow in the storefront, reload its receipt and open the same receipt URL in a separate browser session. Confirm the receipt survives a backend redeploy and the second session cannot access it. A backend failure must preserve the cart and must not display a success confirmation.
 
 ## Retention, investigation and recovery
 
-The configured daily cron calls `/internal/cleanup` during the 04:00 UTC hour. Vercel sends `CRON_SECRET` as a bearer token. Cleanup is safe to repeat; reads enforce expiry independently. Hobby cron is best effort and failed runs are not automatically retried, so inspect failures before relying on cleanup. `npm run cleanup` offers an authenticated-operator recovery path with the database URL supplied privately. [Cron authentication and behavior](https://vercel.com/docs/cron-jobs/manage-cron-jobs).
+The configured daily cron calls `/internal/cleanup` during the 04:00 UTC hour. Vercel sends `CRON_SECRET` as a bearer token. Cleanup is safe to repeat; reads enforce resolved-receipt expiry independently. Pending and review Stripe records are deliberately retained beyond their nominal expiry and excluded from cleanup, so unresolved payment evidence is not deleted. Inspect and reconcile unresolved attempts; the daily task does not reconcile payments. No automatic resolution deadline is promised. Hobby cron is best effort and failed runs are not automatically retried, so inspect failures before relying on cleanup. `npm run cleanup` offers an authenticated-operator recovery path with the database URL supplied privately. [Cron authentication and behavior](https://vercel.com/docs/cron-jobs/manage-cron-jobs).
 
 Use request IDs and sanitized status/duration logs to investigate failures. Do not log bearer tokens, database URLs, guest cookies or order request bodies. Free-plan log retention is short; a durable observability pipeline is a future decision rather than an implied feature.
 
@@ -61,4 +78,4 @@ For code rollback, choose the last verified production deployment in Vercel and 
 
 When rotating `ORDERS_API_SECRET`, update backend and storefront in a coordinated maintenance window and redeploy both. The current single-secret design does not offer overlapping old/new keys, so temporary checkout failures are possible during rotation. Rotate `CRON_SECRET` separately on the backend.
 
-No payment processor, money movement, fulfillment, stock reservation or refund workflow is configured. Order data is synthetic; these operational controls do not make the demo a live commerce service.
+Stripe support is test-only. No real money movement, fulfillment, stock reservation or refund workflow is configured. Unresolved payment review currently requires investigation rather than an admin UI. These controls do not make the demo a live commerce service. Keep test webhook delivery enabled while unresolved attempts remain; disabling new checkout is different from discarding outstanding payment evidence.

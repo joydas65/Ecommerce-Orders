@@ -17,7 +17,9 @@ function objectFields(value, required, optional = []) {
 }
 
 export function quoteInput(input) {
-  objectFields(input, ['items', 'shippingMethod', 'destination']);
+  objectFields(input, ['items', 'shippingMethod', 'destination'], ['paymentProvider']);
+  const paymentProvider = input.paymentProvider ?? 'simulated';
+  if (!['simulated', 'stripe-test'].includes(paymentProvider) || input.paymentProvider === null) throw invalid();
   if (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 6) throw invalid();
   if (!['demo-standard', 'demo-express'].includes(input.shippingMethod)) throw invalid();
   objectFields(input.destination, ['country'], ['region']);
@@ -35,7 +37,7 @@ export function quoteInput(input) {
   const shippingCents = input.shippingMethod === 'demo-standard' ? 500 : 1200;
   const subtotalCents = items.reduce((sum, item) => sum + item.lineTotalCents, 0);
   const taxCents = Math.round((subtotalCents + shippingCents) * 8 / 100);
-  return { currency: 'USD', items, shippingMethod: input.shippingMethod, shippingCents, subtotalCents, taxCents, totalCents: subtotalCents + shippingCents + taxCents, pricingVersion: 'demo-v1' };
+  return { currency: 'USD', items, shippingMethod: input.shippingMethod, shippingCents, subtotalCents, taxCents, totalCents: subtotalCents + shippingCents + taxCents, pricingVersion: 'demo-v1', paymentProvider };
 }
 
 export function submissionInput(input, key) {

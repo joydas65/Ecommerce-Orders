@@ -52,10 +52,10 @@ async function http(path, { method = 'GET', guest = randomUUID(), key, body, aut
 
 test('migrations are repeatable and reject changes to an applied migration', async () => {
   await migrate(pool);
-  const original = (await pool.query('SELECT checksum FROM schema_migrations')).rows[0].checksum;
+  const original = (await pool.query('SELECT name, checksum FROM schema_migrations')).rows;
   await pool.query("UPDATE schema_migrations SET checksum = 'modified'");
   await assert.rejects(migrate(pool), /applied migration was modified/);
-  await pool.query('UPDATE schema_migrations SET checksum = $1', [original]);
+  for (const migration of original) await pool.query('UPDATE schema_migrations SET checksum = $1 WHERE name = $2', [migration.checksum, migration.name]);
   await migrate(pool);
 });
 

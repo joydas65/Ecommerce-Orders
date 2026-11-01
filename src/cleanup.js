@@ -4,7 +4,7 @@ import { createPool, transaction } from './database.js';
 
 export async function cleanupExpired(pool, now = new Date()) {
   return transaction(pool, async (client) => {
-    const orders = await client.query('DELETE FROM orders WHERE expires_at <= $1', [now]);
+    const orders = await client.query("DELETE FROM orders WHERE expires_at <= $1 AND NOT (payment_provider = 'stripe-test' AND receipt->>'status' IN ('PENDING_PAYMENT', 'PAYMENT_REVIEW'))", [now]);
     // Cascading deletes remove replay records. Keep consumed quotes while their
     // receipt is live; remove unconsumed expired quotes and old receipt quotes.
     const candidates = await client.query('SELECT id FROM checkout_quotes WHERE expires_at <= $1 FOR UPDATE SKIP LOCKED', [now]);

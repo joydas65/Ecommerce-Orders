@@ -11,5 +11,9 @@
     "test": "node --test --test-concurrency=1 test/*.test.js",
     "check": "node --check src/api.js && node --check src/database.js && node --check src/service.js && node --check src/runtime.js && node --check api/index.js"
   },
-  "dependencies": { "pg": "8.23.1" }
+  "dependencies": { "pg": "8.23.1" },
+  "devDependencies": { "@vercel/routing-utils": "6.6.1" },
+  "overrides": {
+    "@vercel/routing-utils": { "path-to-regexp": "6.3.0" }
+  }
 }

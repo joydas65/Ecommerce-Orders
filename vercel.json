@@ -11,7 +11,7 @@
     }
   },
   "rewrites": [
-    { "source": "/v1/:path*", "destination": "/api/index" },
+    { "source": "/v1/(.*)", "destination": "/api/index" },
     { "source": "/health", "destination": "/api/index" },
     { "source": "/internal/cleanup", "destination": "/api/index" }
   ],

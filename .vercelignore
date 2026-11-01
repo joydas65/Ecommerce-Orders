@@ -1,0 +1,11 @@
+.git/
+.github/
+.env*
+node_modules/
+test/
+coverage/
+test-results/
+playwright-report/
+*.log
+docs/
+README.md

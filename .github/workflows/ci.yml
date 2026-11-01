@@ -1,0 +1,82 @@
+name: Verify orders
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a migration partway through a release.
+concurrency:
+  group: orders-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Orders verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b
+        env:
+          POSTGRES_DB: orders_test
+          POSTGRES_USER: orders_test
+          POSTGRES_PASSWORD: local-ci-only
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U orders_test -d orders_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://orders_test:local-ci-only@127.0.0.1:5433/orders_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - name: Verify real PostgreSQL transactions and HTTP behavior
+        run: npm test
+      - name: Verify release checks
+        run: node --test scripts/release/*.test.mjs
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  migrate:
+    name: Orders production migration
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Configure this environment with a main-only branch policy. No production
+    # secret is available to pull requests or the verification job above.
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Reject stale releases before touching the database
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: test "$(gh api repos/"$GITHUB_REPOSITORY"/git/ref/heads/main --jq .object.sha)" = "$GITHUB_SHA"
+      - name: Apply checked migrations under a database transaction lock
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          node --input-type=module -e "if (!process.env.DATABASE_URL) throw new Error('Configure the production environment DATABASE_URL secret before releasing.');"
+          npm run migrate

@@ -1,0 +1,229 @@
+openapi: 3.1.0
+info:
+  title: Joy's Store persistent demo orders
+  version: 1.0.0
+  description: Synthetic, session-owned receipts. No payment is collected and no personal shipping data is accepted. The deployed API requires a server-to-server bearer secret; browser callers use the storefront's same-origin server routes.
+security:
+  - serviceBearer: []
+paths:
+  /v1/checkout-quotes:
+    post:
+      operationId: createQuote
+      parameters:
+        - $ref: '#/components/parameters/Guest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [items, shippingMethod, destination]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 6
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [productId, quantity]
+                    properties:
+                      productId: { $ref: '#/components/schemas/ProductId' }
+                      quantity: { type: integer, minimum: 1, maximum: 99 }
+                shippingMethod: { $ref: '#/components/schemas/ShippingMethod' }
+                destination:
+                  type: object
+                  additionalProperties: false
+                  required: [country]
+                  properties:
+                    country: { type: string, enum: [US, GB, SG] }
+                    region:
+                      type: string
+                      description: US requires CA, NY, or TX. GB and SG require an empty or omitted region.
+      responses:
+        '201':
+          description: Authoritative quote valid for fifteen minutes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/orders:
+    post:
+      operationId: placeOrder
+      parameters:
+        - $ref: '#/components/parameters/Guest'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Generate once per checkout attempt and retain across ambiguous failures and reloads. Same key with another quote is rejected.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [quoteId]
+              properties:
+                quoteId: { type: string, pattern: '^quote_[0-9a-f-]{36}$' }
+      responses:
+        '201':
+          description: Order and durable replay record committed atomically; the quote can create only one order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '200':
+          description: Original order replayed, including when the quote subsequently expires.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '410': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/orders/{id}:
+    get:
+      operationId: readReceipt
+      parameters:
+        - $ref: '#/components/parameters/Guest'
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^order_[0-9a-f-]{36}$' }
+      responses:
+        '200':
+          description: The authenticated guest's receipt. No-store; unavailable after thirty days.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404':
+          description: Missing, foreign-owner, malformed, and expired order identities return the same public response.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /internal/cleanup:
+    get:
+      operationId: cleanupExpired
+      security:
+        - cleanupBearer: []
+      responses:
+        '200':
+          description: Expired receipts, replay records and unconsumed quotes removed; returns aggregate counts only.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders: { type: integer, minimum: 0 }
+                  quotes: { type: integer, minimum: 0 }
+        '401': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /health:
+    get:
+      security: []
+      operationId: health
+      responses:
+        '200':
+          description: Application is running. Does not claim database readiness.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { const: ok }
+components:
+  securitySchemes:
+    serviceBearer:
+      type: http
+      scheme: bearer
+      description: ORDERS_API_SECRET of at least 32 printable non-space characters, stored only on the storefront and orders servers. The guest header is trusted only from this authenticated server-to-server caller.
+    cleanupBearer:
+      type: http
+      scheme: bearer
+      description: Separate CRON_SECRET. The checkout secret cannot authorize retention cleanup.
+  parameters:
+    Guest:
+      name: X-Guest-Id
+      in: header
+      required: true
+      description: UUID guest identity supplied by the trusted storefront server from its opaque, HttpOnly guest cookie. Never accept a browser-supplied guest header in the storefront proxy.
+      schema: { type: string, format: uuid }
+  schemas:
+    ProductId:
+      type: string
+      enum: [demo-desk-mat, demo-notebook, demo-bottle, demo-tote, demo-laptop-stand, demo-desk-lamp]
+    ShippingMethod:
+      type: string
+      enum: [demo-standard, demo-express]
+    LineItem:
+      type: object
+      required: [productId, name, quantity, unitPriceCents, lineTotalCents]
+      properties:
+        productId: { $ref: '#/components/schemas/ProductId' }
+        name: { type: string }
+        quantity: { type: integer, minimum: 1, maximum: 99 }
+        unitPriceCents: { type: integer, minimum: 0 }
+        lineTotalCents: { type: integer, minimum: 0 }
+    Totals:
+      type: object
+      required: [currency, items, shippingMethod, shippingCents, subtotalCents, taxCents, totalCents, pricingVersion]
+      properties:
+        currency: { const: USD }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 6
+          items: { $ref: '#/components/schemas/LineItem' }
+        shippingMethod: { $ref: '#/components/schemas/ShippingMethod' }
+        shippingCents: { type: integer, minimum: 0 }
+        subtotalCents: { type: integer, minimum: 0 }
+        taxCents: { type: integer, minimum: 0, description: 'Illustrative 8% of products plus shipping, rounded half-up in cents.' }
+        totalCents: { type: integer, minimum: 0 }
+        pricingVersion: { const: demo-v1 }
+    Quote:
+      allOf:
+        - $ref: '#/components/schemas/Totals'
+        - type: object
+          required: [id, expiresAt]
+          properties:
+            id: { type: string, pattern: '^quote_[0-9a-f-]{36}$' }
+            expiresAt: { type: string, format: date-time }
+    Order:
+      allOf:
+        - $ref: '#/components/schemas/Totals'
+        - type: object
+          required: [id, reference, quoteId, status, paymentStatus, createdAt, expiresAt]
+          properties:
+            id: { type: string, pattern: '^order_[0-9a-f-]{36}$' }
+            reference: { type: string, pattern: '^DEMO-' }
+            quoteId: { type: string, pattern: '^quote_[0-9a-f-]{36}$' }
+            status: { const: CONFIRMED }
+            paymentStatus: { const: SIMULATED }
+            createdAt: { type: string, format: date-time }
+            expiresAt: { type: string, format: date-time }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+  responses:
+    Error:
+      description: Structured safe failure. An ambiguous 503 must retain the original submission key for retry.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

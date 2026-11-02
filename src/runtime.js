@@ -3,6 +3,7 @@ import { createPool } from './database.js';
 import { OrderService } from './service.js';
 import { cleanupExpired } from './cleanup.js';
 import { stripeGatewayFromEnv } from './stripe-gateway.js';
+import { MerchantPaymentChecks } from './merchant-payment-checks.js';
 import { MerchantOrders } from './merchant-orders.js';
 import { createMerchantAuth } from './merchant-auth.js';
 import { ApiError } from './errors.js';
@@ -22,7 +23,8 @@ export function runtimeHandler(request, response) {
           return auth;
         } catch { throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Merchant sign-in is temporarily unavailable.'); }
       };
-      runtime = createHandler({ merchantOrders: new MerchantOrders(pool), merchantAuth, authorizeMerchant: (request) => merchantAuth().authorize(request), service: new OrderService(pool, { stripeGateway: stripeGatewayFromEnv() }), secret: process.env.ORDERS_API_SECRET, cronSecret: process.env.CRON_SECRET, cleanup: () => cleanupExpired(pool) });
+      const service = new OrderService(pool, { stripeGateway: stripeGatewayFromEnv() });
+      runtime = createHandler({ service, merchantPaymentChecks: new MerchantPaymentChecks(pool, { service }), merchantOrders: new MerchantOrders(pool), merchantAuth, authorizeMerchant: (request) => merchantAuth().authorize(request), secret: process.env.ORDERS_API_SECRET, cronSecret: process.env.CRON_SECRET, cleanup: () => cleanupExpired(pool) });
     } catch {
       response.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store' });
       response.end(JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Orders are temporarily unavailable.' } }));

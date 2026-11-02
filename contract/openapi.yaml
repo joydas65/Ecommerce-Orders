@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Joy's Store test checkout and persistent orders
-  version: 1.2.0
-  description: Session-owned simulated orders and optional Stripe hosted test checkout. No real money moves and the order API accepts no personal shipping data. Browser callers use the storefront BFF; service routes require bearer authentication and a guest identity. Stripe webhooks instead verify the signature on the raw request body. Guest checkout routes reject query parameters. Read-only merchant routes instead require a valid database-backed session for an explicitly allowed GitHub identity; the checkout bearer cannot authorize merchant access.
+  version: 1.3.0
+  description: Session-owned simulated orders and optional Stripe hosted test checkout. No real money moves and the order API accepts no personal shipping data. Browser callers use the storefront BFF; service routes require bearer authentication and a guest identity. Stripe webhooks instead verify the signature on the raw request body. Guest checkout routes reject query parameters. Merchant routes instead require a valid database-backed session for an explicitly allowed GitHub identity; the checkout bearer cannot authorize merchant access.
 security:
   - serviceBearer: []
 paths:
@@ -102,7 +102,7 @@ paths:
           schema: { type: string, pattern: '^order_[0-9a-f-]{36}$' }
       responses:
         '200':
-          description: The authenticated guest's receipt. Private no-store. Resolved receipts normally expire after thirty days; Stripe confirmation starts a fresh thirty-day period. Pending/review Stripe receipts remain readable until resolved.
+          description: The authenticated guest's receipt. Private no-store. Resolved receipts normally expire after thirty days; First verified Stripe payment or cancellation starts a fresh thirty-day period. Pending/review Stripe receipts remain readable until resolved.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Order' }
@@ -234,7 +234,7 @@ paths:
     get:
       operationId: listMerchantOrders
       security: [{ merchantSession: [] }]
-      description: Newest-first live keyset view ordered by (created_at, id), with precise timestamps and a stable unique tie-breaker. A cursor is bound to its filter and does not grant authorization. Refresh to see newer orders. Resolved expired receipts are excluded; unresolved Stripe records remain visible. Unknown or duplicate query parameters fail validation. No mutation is supported.
+      description: Newest-first live keyset view ordered by (created_at, id), with precise timestamps and a stable unique tie-breaker. A cursor is bound to its filter and does not grant authorization. Refresh to see newer orders. Resolved expired receipts are excluded; unresolved Stripe records remain visible. Unknown or duplicate query parameters fail validation. This collection endpoint is read-only.
       parameters:
         - name: status
           in: query
@@ -272,6 +272,79 @@ paths:
         '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+  /v1/merchant/orders/{id}/payment-checks:
+    get:
+      operationId: readMerchantPaymentChecks
+      security: [{ merchantSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      description: Latest twenty audit events ordered by a durable event sequence, plus current eligibility. No query parameters. Events follow order retention; deleting a merchant identity does not erase actor attribution. Application events are append-only, not tamper-proof database storage.
+      responses:
+        '200':
+          description: Eligibility and bounded history. Private no-store.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantPaymentCheckHistory' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/merchant/orders/{id}/recheck-payment:
+    post:
+      operationId: recheckMerchantPayment
+      security: [{ merchantSession: [] }]
+      description: >-
+        Retrieves only an existing session for an unresolved Stripe-test order; never creates or expires a session.
+        Requires an independent live merchant session and exact storefront Origin; cross-site/same-site Fetch metadata is rejected.
+        JSON is bounded to 16 KiB and query parameters are rejected. Persist one requestId across transport/503 ambiguity and retries.
+        Actor-scoped request IDs bind to one order. Requested event commits before retrieval under a 30-second fenced lease.
+        Final verified transition and result audit commit atomically. Replays return the saved event plus latest order state.
+        New requests are limited to one per order per ten seconds and five per merchant per minute.
+        Initial session authorization covers the bounded in-flight request; subsequent requests revalidate authorization.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - name: Origin
+          in: header
+          required: true
+          schema: { type: string, format: uri }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [requestId]
+              properties:
+                requestId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: A durable result, not necessarily payment success. provider_unavailable records failed retrieval; interrupted records no saved verified result. Retry a new check only after cooldown. A replay can report an older check with newer order state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantPaymentCheckResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: PAYMENT_CHECK_IN_PROGRESS includes error.retryAt; retry the same key after that time. PAYMENT_CHECK_NOT_ELIGIBLE applies only to an unreserved new request. IDEMPOTENCY_CONFLICT means that actor's key belongs to another order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '429':
+          description: PAYMENT_CHECK_RATE_LIMITED with error.retryAt; wait before starting or retrying the unreserved request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Result is not confirmed; retain and retry the same requestId. Disabled Stripe cannot create a new check.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/auth/sign-in/social:
     post:
       operationId: startMerchantSignIn
@@ -411,6 +484,53 @@ components:
             additionalProperties: false
             maxProperties: 0
   schemas:
+    MerchantPaymentCheckStatus:
+      type: string
+      enum: [PENDING, PAID, CANCELED, REQUIRES_REVIEW]
+    MerchantPaymentCheckEvent:
+      type: object
+      additionalProperties: false
+      required: [id, requestId, actor, occurredAt, outcome, previousPaymentStatus, resultPaymentStatus]
+      properties:
+        id: { type: string, format: uuid }
+        requestId: { type: string, format: uuid }
+        actor:
+          type: object
+          additionalProperties: false
+          required: [id, displayName]
+          properties:
+            id: { type: string, minLength: 1, maxLength: 128 }
+            displayName: { type: string, minLength: 1, maxLength: 80 }
+        occurredAt: { type: string, format: date-time }
+        outcome: { type: string, enum: [requested, paid, pending, canceled, review_required, provider_unavailable, already_resolved, interrupted] }
+        previousPaymentStatus: { $ref: '#/components/schemas/MerchantPaymentCheckStatus' }
+        resultPaymentStatus: { $ref: '#/components/schemas/MerchantPaymentCheckStatus' }
+    MerchantPaymentCheckHistory:
+      type: object
+      additionalProperties: false
+      required: [eligibility, events, hasMore]
+      properties:
+        eligibility:
+          type: object
+          additionalProperties: false
+          required: [eligible, reason, retryAt]
+          properties:
+            eligible: { type: boolean }
+            reason: { type: string, enum: [ready, not_stripe, resolved, missing_session, in_progress, cooldown, payments_disabled] }
+            retryAt: { type: [string, 'null'], format: date-time }
+        events:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/MerchantPaymentCheckEvent' }
+        hasMore: { type: boolean }
+    MerchantPaymentCheckResult:
+      type: object
+      additionalProperties: false
+      required: [order, check, replayed]
+      properties:
+        order: { $ref: '#/components/schemas/Order' }
+        check: { $ref: '#/components/schemas/MerchantPaymentCheckEvent' }
+        replayed: { type: boolean }
     MerchantOrderPage:
       type: object
       additionalProperties: false
@@ -558,6 +678,7 @@ components:
           properties:
             code: { type: string }
             message: { type: string }
+            retryAt: { type: string, format: date-time, description: Present for payment-check in-progress and rate-limit errors. }
   responses:
     PaymentSession:
       description: Current persisted Stripe test order and a resumable hosted URL when available.

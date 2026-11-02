@@ -15,12 +15,23 @@ export async function seedMerchantSessions({ pool, env = process.env }) {
     || !['localhost', '127.0.0.1', '[::1]'].includes(database.hostname)) throw new Error('Merchant fixtures require explicit opt-in and disposable loopback PostgreSQL.');
   const config = merchantAuthConfiguration(env);
   if (!config || config.secure || !['localhost', '127.0.0.1'].includes(new URL(config.origin).hostname)) throw new Error('Merchant fixtures require local authentication.');
+  const runId = env.MERCHANT_TEST_RUN_ID;
+  if (runId !== undefined && !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(runId)) throw new Error('Merchant fixture run ID must be a UUID.');
+  const suffix = runId ? `_${runId.toLowerCase()}` : '';
   const auth = betterAuth(merchantAuthOptions(pool, config));
   const context = await auth.$context;
   async function seed(kind, githubId, expiresAt) {
-    const userId = `local_fixture_${kind}`;
+    const userId = `local_fixture_${kind}${suffix}`;
+    // A GitHub account can belong to only one fixture identity. Remove only
+    // identities created by this loopback-only helper; audit actor IDs have no
+    // user foreign key and remain attached to their retained orders.
+    const existing = (await pool.query('SELECT "userId" FROM merchant_accounts WHERE "providerId" = $1 AND "accountId" = $2', ['github', githubId])).rows;
+    for (const account of existing) {
+      if (!/^local_fixture_(merchant|ordinary)(_[a-f0-9-]{36})?$/.test(account.userId)) throw new Error('Refusing to replace a non-fixture merchant account.');
+      await pool.query('DELETE FROM merchant_users WHERE id = $1', [account.userId]);
+    }
     await pool.query('DELETE FROM merchant_users WHERE id = $1', [userId]);
-    await pool.query('INSERT INTO merchant_users (id, name, email, "emailVerified") VALUES ($1, $2, $3, true)', [userId, `Local ${kind}`, `${kind}@merchant-fixture.test`]);
+    await pool.query('INSERT INTO merchant_users (id, name, email, "emailVerified") VALUES ($1, $2, $3, true)', [userId, `Local ${kind}`, `${kind}${suffix}@merchant-fixture.test`]);
     await pool.query('INSERT INTO merchant_accounts (id, "accountId", "providerId", "userId", "updatedAt") VALUES ($1, $2, $3, $4, now())', [randomUUID(), githubId, 'github', userId]);
     const session = await context.internalAdapter.createSession(userId);
     if (expiresAt) await pool.query('UPDATE merchant_sessions SET "expiresAt" = $1 WHERE id = $2', [expiresAt, session.id]);

@@ -146,30 +146,34 @@ export class OrderService {
     let session;
     try { session = await this.stripe.retrieve(sessionId); }
     catch { throw unavailable(); }
-    return transaction(this.pool, async (client) => {
-      const current = (await client.query('SELECT o.receipt, p.stripe_session_id, p.payment_intent_id FROM orders o JOIN payment_sessions p ON p.order_id = o.id WHERE o.id = $1 FOR UPDATE OF o, p', [orderId])).rows[0];
-      if (!current) throw missingOrder();
-      let order = current.receipt;
-      if (event && (await client.query('SELECT event_id FROM stripe_events WHERE event_id = $1', [event.id])).rowCount) return { order, checkoutUrl: null };
-      const intentId = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id ?? null;
-      const valid = session.id === sessionId && (!current.stripe_session_id || current.stripe_session_id === sessionId)
-        && (!current.payment_intent_id || current.payment_intent_id === intentId) && verifiedSession(session, order);
-      if (order.status !== 'CONFIRMED') {
-        if (!valid) {
-          if (order.status !== 'CANCELED') order = { ...order, status: 'PAYMENT_REVIEW', paymentStatus: 'REQUIRES_REVIEW' };
-        } else {
-          await client.query('UPDATE payment_sessions SET stripe_session_id = $2, payment_intent_id = $3, session_expires_at = $4 WHERE order_id = $1', [orderId, sessionId, intentId, new Date(session.expires_at * 1000)]);
-          if (session.payment_status === 'paid') {
-            order = { ...order, status: 'CONFIRMED', paymentStatus: 'PAID', expiresAt: new Date(this.now().getTime() + orderLifetime).toISOString() };
-          } else if (session.status === 'expired') order = { ...order, status: 'CANCELED', paymentStatus: 'CANCELED' };
-          else if (order.status !== 'CANCELED' && (event?.type === 'checkout.session.async_payment_failed' || order.status === 'PAYMENT_REVIEW')) order = { ...order, status: 'PAYMENT_REVIEW', paymentStatus: 'REQUIRES_REVIEW' };
-        }
-        await client.query('UPDATE orders SET receipt = $2, expires_at = $3 WHERE id = $1', [orderId, order, order.expiresAt]);
-        await client.query('UPDATE order_submissions SET expires_at = $2 WHERE order_id = $1', [orderId, order.expiresAt]);
+    return transaction(this.pool, (client) => this.applyRetrievedSession(client, session, sessionId, orderId, event));
+  }
+
+  // Caller owns the transaction. Merchant audit completion shares this exact
+  // verified state transition with signed webhooks and shopper reconciliation.
+  async applyRetrievedSession(client, session, sessionId, orderId, event = null) {
+    const current = (await client.query('SELECT o.receipt, p.stripe_session_id, p.payment_intent_id FROM orders o JOIN payment_sessions p ON p.order_id = o.id WHERE o.id = $1 FOR UPDATE OF o, p', [orderId])).rows[0];
+    if (!current) throw missingOrder();
+    let order = current.receipt;
+    if (event && (await client.query('SELECT event_id FROM stripe_events WHERE event_id = $1', [event.id])).rowCount) return { order, checkoutUrl: null };
+    const intentId = typeof session?.payment_intent === 'string' ? session.payment_intent : session?.payment_intent?.id ?? null;
+    const valid = session?.id === sessionId && (!current.stripe_session_id || current.stripe_session_id === sessionId)
+      && (!current.payment_intent_id || current.payment_intent_id === intentId) && verifiedSession(session, order);
+    if (order.status !== 'CONFIRMED') {
+      if (!valid) {
+        if (order.status !== 'CANCELED') order = { ...order, status: 'PAYMENT_REVIEW', paymentStatus: 'REQUIRES_REVIEW' };
+      } else {
+        await client.query('UPDATE payment_sessions SET stripe_session_id = $2, payment_intent_id = $3, session_expires_at = $4 WHERE order_id = $1', [orderId, sessionId, intentId, new Date(session.expires_at * 1000)]);
+        if (session.payment_status === 'paid') {
+          order = { ...order, status: 'CONFIRMED', paymentStatus: 'PAID', expiresAt: new Date(this.now().getTime() + orderLifetime).toISOString() };
+        } else if (session.status === 'expired' && order.status !== 'CANCELED') order = { ...order, status: 'CANCELED', paymentStatus: 'CANCELED', expiresAt: new Date(this.now().getTime() + orderLifetime).toISOString() };
+        else if (order.status !== 'CANCELED' && (event?.type === 'checkout.session.async_payment_failed' || order.status === 'PAYMENT_REVIEW')) order = { ...order, status: 'PAYMENT_REVIEW', paymentStatus: 'REQUIRES_REVIEW' };
       }
-      if (event) await client.query('INSERT INTO stripe_events (event_id, order_id, session_id, event_type) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING', [event.id, orderId, sessionId, event.type]);
-      return { order, checkoutUrl: valid && order.status === 'PENDING_PAYMENT' && session.status === 'open' ? checkoutUrl(session.url) : null };
-    });
+      await client.query('UPDATE orders SET receipt = $2, expires_at = $3 WHERE id = $1', [orderId, order, order.expiresAt]);
+      await client.query('UPDATE order_submissions SET expires_at = $2 WHERE order_id = $1', [orderId, order.expiresAt]);
+    }
+    if (event) await client.query('INSERT INTO stripe_events (event_id, order_id, session_id, event_type) VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING', [event.id, orderId, sessionId, event.type]);
+    return { order, checkoutUrl: valid && order.status === 'PENDING_PAYMENT' && session.status === 'open' ? checkoutUrl(session.url) : null };
   }
 
   async webhook(raw, signature) {

@@ -55,7 +55,7 @@ function send(response, status, body, requestId) {
 }
 
 // Native IncomingMessage/ServerResponse API shared by Vercel and local HTTP.
-export function createHandler({ service, secret, cronSecret, cleanup, merchantOrders, authorizeMerchant, merchantAuth, logger = console.info }) {
+export function createHandler({ service, secret, cronSecret, cleanup, merchantOrders, merchantPaymentChecks, authorizeMerchant, merchantAuth, logger = console.info }) {
   return async function handler(request, response) {
     const started = performance.now();
     const requestId = randomUUID();
@@ -124,7 +124,24 @@ export function createHandler({ service, secret, cronSecret, cleanup, merchantOr
         const identity = await authorizeMerchant(request);
         if (typeof identity?.userId !== 'string' || !identity.userId) throw new ApiError(401, 'AUTH_REQUIRED', 'Sign in to view merchant orders.');
         if (identity.role !== 'merchant') throw new ApiError(403, 'MERCHANT_FORBIDDEN', 'Merchant access is required.');
-        if (request.method !== 'GET') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Merchant orders are read-only.');
+        const action = path.match(/^\/v1\/merchant\/orders\/([^/]+)\/(payment-checks|recheck-payment)$/);
+        if (action) {
+          const requiredMethod = action[2] === 'payment-checks' ? 'GET' : 'POST';
+          if (request.method !== requiredMethod) throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'This payment check method is unavailable.');
+          if (url.search) throw invalid();
+          if (!merchantPaymentChecks) throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Payment checks are temporarily unavailable.');
+          if (requiredMethod === 'POST') {
+            const origin = typeof merchantAuth === 'function' ? merchantAuth()?.origin : null;
+            if (!origin || request.headers.origin !== origin || ['cross-site', 'same-site'].includes(request.headers['sec-fetch-site'])) {
+              throw new ApiError(403, 'AUTH_ORIGIN_INVALID', 'Open payment checks from the storefront.');
+            }
+          }
+          const result = requiredMethod === 'GET' ? await merchantPaymentChecks.history(identity, action[1])
+            : await merchantPaymentChecks.recheck(identity, action[1], await jsonBody(request));
+          status = 200;
+          return send(response, status, result, requestId);
+        }
+        if (request.method !== 'GET') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'This merchant method is unavailable.');
         let result;
         if (path === '/v1/merchant/session') {
           if (url.search) throw invalid();
@@ -170,7 +187,7 @@ export function createHandler({ service, secret, cronSecret, cleanup, merchantOr
       status = error instanceof ApiError ? error.status : 503;
       const code = error instanceof ApiError ? error.code : 'SERVICE_UNAVAILABLE';
       const message = error instanceof ApiError ? error.message : 'Orders are temporarily unavailable. Please retry with the same submission key.';
-      if (!response.headersSent) send(response, status, { error: { code, message } }, requestId);
+      if (!response.headersSent) send(response, status, { error: { code, message, ...(error instanceof ApiError && typeof error.retryAt === 'string' ? { retryAt: error.retryAt } : {}) } }, requestId);
     } finally {
       // Deliberately omit URLs, headers, SQL, input, receipt and error messages.
       try {

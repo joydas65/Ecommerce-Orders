@@ -55,7 +55,7 @@ function send(response, status, body, requestId) {
 }
 
 // Native IncomingMessage/ServerResponse API shared by Vercel and local HTTP.
-export function createHandler({ service, secret, cronSecret, cleanup, merchantOrders, merchantPaymentChecks, authorizeMerchant, merchantAuth, logger = console.info }) {
+export function createHandler({ service, secret, cronSecret, cleanup, merchantOrders, merchantPaymentChecks, authorizeMerchant, merchantAuth, customerOrders, authorizeCustomer, customerAuth, logger = console.info }) {
   return async function handler(request, response) {
     const started = performance.now();
     const requestId = randomUUID();
@@ -81,27 +81,41 @@ export function createHandler({ service, secret, cronSecret, cleanup, merchantOr
         status = 200;
         return send(response, status, result, requestId);
       }
-      if (path === '/api/auth' || path.startsWith('/api/auth/')) {
-        const methods = { '/api/auth/ok': 'GET', '/api/auth/callback/github': 'GET', '/api/auth/sign-in/social': 'POST', '/api/auth/sign-out': 'POST' };
+      const customerAuthPath = path === '/api/customer-auth' || path.startsWith('/api/customer-auth/');
+      if (customerAuthPath || path === '/api/auth' || path.startsWith('/api/auth/')) {
+        const prefix = customerAuthPath ? '/api/customer-auth' : '/api/auth';
+        const endpoint = path.slice(prefix.length + 1);
+        const methods = Object.fromEntries(Object.entries({ ok: 'GET', 'callback/google': 'GET', 'sign-in/social': 'POST', 'sign-out': 'POST',
+          ...(!customerAuthPath ? { 'callback/github': 'GET', 'link-social': 'POST' } : {}) }).map(([name, method]) => [`${prefix}/${name}`, method]));
         if (!Object.hasOwn(methods, path)) throw new ApiError(404, 'NOT_FOUND', 'This endpoint is unavailable.');
         if (request.method !== methods[path]) throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'This authentication method is unavailable.');
-        if (typeof merchantAuth !== 'function') throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Merchant sign-in is temporarily unavailable.');
-        const auth = merchantAuth();
-        if (!auth?.origin || typeof auth.handler !== 'function') throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Merchant sign-in is temporarily unavailable.');
-        if (request.url.length > 8192 || (path !== '/api/auth/callback/github' && url.search)) throw invalid();
+        const factory = customerAuthPath ? customerAuth : merchantAuth;
+        const authUnavailable = () => new ApiError(503, customerAuthPath ? 'CUSTOMER_UNAVAILABLE' : 'MERCHANT_UNAVAILABLE', 'Sign-in is temporarily unavailable.');
+        if (typeof factory !== 'function') throw authUnavailable();
+        const auth = factory();
+        if (!auth?.origin || typeof auth.handler !== 'function') throw authUnavailable();
+        const providers = customerAuthPath ? ['google'] : auth.enabledProviders || ['github'];
+        if (endpoint.startsWith('callback/') && !providers.includes(endpoint.slice('callback/'.length))) throw new ApiError(404, 'NOT_FOUND', 'This endpoint is unavailable.');
+        if (request.url.length > 8192 || (!endpoint.startsWith('callback/') && url.search)) throw invalid();
         let body;
         if (request.method === 'POST') {
-          if (request.headers.origin !== auth.origin) throw new ApiError(403, 'AUTH_ORIGIN_INVALID', 'Open merchant sign-in from the storefront.');
+          if (request.headers.origin !== auth.origin || ['cross-site', 'same-site'].includes(request.headers['sec-fetch-site'])) throw new ApiError(403, 'AUTH_ORIGIN_INVALID', 'Open sign-in from the storefront.');
           const input = await jsonBody(request);
           if (!input || typeof input !== 'object' || Array.isArray(input)) throw invalid();
-          if (path === '/api/auth/sign-in/social') {
+          if (endpoint === 'sign-in/social' || endpoint === 'link-social') {
             if (Object.keys(input).sort().join(',') !== 'callbackURL,errorCallbackURL,provider'
-              || input.provider !== 'github' || input.callbackURL !== '/admin/orders' || input.errorCallbackURL !== '/admin/sign-in') throw invalid();
+              || !providers.includes(input.provider) || input.callbackURL !== (customerAuthPath ? '/account' : '/admin/orders')
+              || input.errorCallbackURL !== (customerAuthPath ? '/account/sign-in' : '/admin/sign-in')) throw invalid();
+            if (endpoint === 'link-social') {
+              if (input.provider !== 'google' || typeof auth.authorize !== 'function') throw invalid();
+              const merchant = await auth.authorize(request);
+              if (merchant?.role !== 'merchant') throw new ApiError(403, 'MERCHANT_FORBIDDEN', 'Merchant access is required.');
+            }
           } else if (Object.keys(input).length) throw invalid();
           body = JSON.stringify(input);
         }
         const headers = new Headers();
-        for (const name of ['cookie', 'origin', 'content-type', 'user-agent', 'x-forwarded-for']) {
+        for (const name of ['cookie', 'origin', 'content-type', 'sec-fetch-site', 'user-agent', 'x-forwarded-for']) {
           if (typeof request.headers[name] === 'string') headers.set(name, request.headers[name]);
         }
         const result = await auth.handler(new Request(new URL(request.url, auth.origin), { method: request.method, headers, ...(body === undefined ? {} : { body }) }));
@@ -146,6 +160,8 @@ export function createHandler({ service, secret, cronSecret, cleanup, merchantOr
         if (path === '/v1/merchant/session') {
           if (url.search) throw invalid();
           result = { user: { id: identity.userId }, role: 'merchant' };
+          const auth = typeof merchantAuth === 'function' ? merchantAuth() : null;
+          if (typeof auth?.accountStatus === 'function') result.authentication = { providers: auth.enabledProviders, ...await auth.accountStatus(request) };
         } else if (path === '/v1/merchant/orders') result = await merchantOrders.list(url.searchParams);
         else if (path.startsWith('/v1/merchant/orders/')) {
           if (url.search) throw new ApiError(400, 'INVALID_MERCHANT_QUERY', 'Choose a valid payment filter and page.');
@@ -154,19 +170,46 @@ export function createHandler({ service, secret, cronSecret, cleanup, merchantOr
         status = 200;
         return send(response, status, result, requestId);
       }
+      if (path === '/v1/customer' || path.startsWith('/v1/customer/')) {
+        if (!customerOrders || typeof authorizeCustomer !== 'function') throw new ApiError(503, 'CUSTOMER_UNAVAILABLE', 'Your account is temporarily unavailable.');
+        const identity = await authorizeCustomer(request);
+        if (typeof identity?.userId !== 'string' || !identity.userId || identity.role !== 'customer') throw new ApiError(401, 'AUTH_REQUIRED', 'Sign in to view your orders.');
+        if (request.method !== 'GET') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'This account operation is unavailable.');
+        let result;
+        if (path === '/v1/customer/session') {
+          if (url.search) throw invalid();
+          result = { user: { id: identity.userId, displayName: identity.displayName }, role: 'customer' };
+        } else if (path === '/v1/customer/orders') result = await customerOrders.list(identity, url.searchParams);
+        else if (/^\/v1\/customer\/orders\/[^/]+$/.test(path)) {
+          if (url.search) throw invalid();
+          result = await customerOrders.read(identity, path.slice('/v1/customer/orders/'.length));
+        } else throw new ApiError(404, 'NOT_FOUND', 'This endpoint is unavailable.');
+        status = 200;
+        return send(response, status, result, requestId);
+      }
       if (!authorized(request.headers.authorization, secret)) throw new ApiError(401, 'UNAUTHORIZED', 'Service authentication is required.');
       if (url.search) throw invalid();
       const guest = request.headers['x-guest-id'];
+      let customerId = null;
+      // Only a verified shopper session may set ownership. Client-supplied IDs,
+      // roles, guest cookies and the service bearer cannot grant account access.
+      if (request.method === 'POST' && ['/v1/orders', '/v1/payment-sessions'].includes(path)
+        && /(?:^|;\s*)(?:__Secure-)?joys_customer\.session_token=/.test(request.headers.cookie || '')) {
+        if (typeof authorizeCustomer !== 'function') throw new ApiError(503, 'CUSTOMER_UNAVAILABLE', 'Your account is temporarily unavailable.');
+        const identity = await authorizeCustomer(request);
+        if (identity?.role !== 'customer' || typeof identity.userId !== 'string' || !identity.userId) throw new ApiError(401, 'AUTH_REQUIRED', 'Sign in again before submitting this checkout.');
+        customerId = identity.userId;
+      }
       if (request.method === 'POST' && path === '/v1/checkout-quotes') {
         const quote = await service.createQuote(guest, await jsonBody(request));
         status = 201;
         send(response, status, quote, requestId);
       } else if (request.method === 'POST' && path === '/v1/orders') {
-        const result = await service.createOrder(guest, await jsonBody(request), request.headers['idempotency-key']);
+        const result = await service.createOrder(guest, await jsonBody(request), request.headers['idempotency-key'], customerId);
         status = result.replayed ? 200 : 201;
         send(response, status, result.order, requestId);
       } else if (request.method === 'POST' && path === '/v1/payment-sessions') {
-        const result = await service.createPaymentSession(guest, await jsonBody(request), request.headers['idempotency-key']);
+        const result = await service.createPaymentSession(guest, await jsonBody(request), request.headers['idempotency-key'], customerId);
         status = result.replayed ? 200 : 201;
         send(response, status, { order: result.order, checkoutUrl: result.checkoutUrl }, requestId);
       } else if (request.method === 'POST' && /^\/v1\/orders\/[^/]+\/(reconcile|cancel)$/.test(path)) {

@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Joy's Store test checkout and persistent orders
-  version: 1.3.0
-  description: Session-owned simulated orders and optional Stripe hosted test checkout. No real money moves and the order API accepts no personal shipping data. Browser callers use the storefront BFF; service routes require bearer authentication and a guest identity. Stripe webhooks instead verify the signature on the raw request body. Guest checkout routes reject query parameters. Merchant routes instead require a valid database-backed session for an explicitly allowed GitHub identity; the checkout bearer cannot authorize merchant access.
+  version: 1.4.0
+  description: Session-owned simulated orders and optional Stripe hosted test checkout. No real money moves and the order API accepts no personal shipping data. Browser callers use the storefront BFF; service routes require bearer authentication and a guest identity. Stripe webhooks instead verify the signature on the raw request body. Guest checkout routes reject query parameters. Merchant routes require a database-backed merchant session anchored to an explicitly allowed GitHub identity, optionally with explicitly linked Google sign-in. Customer routes independently require a customer Google session and restrict reads to its owned orders. The checkout bearer grants neither role.
 security:
   - serviceBearer: []
 paths:
@@ -56,8 +56,9 @@ paths:
   /v1/orders:
     post:
       operationId: placeOrder
-      description: Confirms only simulated quotes. Stripe quotes must use payment-sessions; payment providers cannot be mixed.
+      description: Confirms only simulated quotes. Stripe quotes must use payment-sessions; payment providers cannot be mixed. An optional customer session binds ownership atomically on the first reservation. Invalid customer sessions fail before creation. Retrying with another customer identity or switching guest/account returns CUSTOMER_CHECKOUT_CHANGED and never transfers ownership. Customer IDs in request bodies are rejected.
       parameters:
+        - $ref: '#/components/parameters/OptionalCustomerSession'
         - $ref: '#/components/parameters/Guest'
         - name: Idempotency-Key
           in: header
@@ -116,8 +117,9 @@ paths:
   /v1/payment-sessions:
     post:
       operationId: createPaymentSession
-      description: Durably creates or replays a Stripe test order and hosted checkout session. Creation and browser return do not confirm payment. Retain the same idempotency key and quote across ambiguous failures; do not start another attempt. Only stripe-test quotes are accepted.
+      description: Durably creates or replays a Stripe test order and hosted checkout session. Creation and browser return do not confirm payment. Retain the same idempotency key and quote across ambiguous failures; do not start another attempt. Only stripe-test quotes are accepted. An optional verified customer session binds ownership at first reservation, before external Stripe work. Session expiry fails before creation; a retry with changed customer identity returns CUSTOMER_CHECKOUT_CHANGED and cannot transfer or attach the existing order.
       parameters:
+        - $ref: '#/components/parameters/OptionalCustomerSession'
         - $ref: '#/components/parameters/Guest'
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -221,6 +223,16 @@ paths:
                 required: [user, role]
                 properties:
                   role: { const: merchant }
+                  authentication:
+                    type: object
+                    additionalProperties: false
+                    required: [providers, googleEnabled, googleLinked]
+                    properties:
+                      providers:
+                        type: array
+                        items: { type: string, enum: [github, google] }
+                      googleEnabled: { type: boolean }
+                      googleLinked: { type: boolean }
                   user:
                     type: object
                     additionalProperties: false
@@ -349,7 +361,7 @@ paths:
     post:
       operationId: startMerchantSignIn
       security: []
-      description: Starts GitHub OAuth through Better Auth. Origin must exactly match the configured storefront origin. The provider, success destination and error destination are fixed. JSON is bounded to 16 KiB. OAuth state, PKCE, session signing and database-backed rate limits are library-managed.
+      description: Starts GitHub or enabled Google OAuth through Better Auth. Google sign-in requires a previously explicitly linked merchant identity; Google cannot create a merchant account. Matching email addresses never imply linking. Origin must exactly match the configured storefront origin. The provider, success destination and error destination are fixed. JSON is bounded to 16 KiB. OAuth state, PKCE, session signing and database-backed rate limits are library-managed.
       parameters:
         - name: Origin
           in: header
@@ -364,11 +376,11 @@ paths:
               additionalProperties: false
               required: [provider, callbackURL, errorCallbackURL]
               properties:
-                provider: { const: github }
+                provider: { type: string, enum: [github, google] }
                 callbackURL: { const: /admin/orders }
                 errorCallbackURL: { const: /admin/sign-in }
       responses:
-        '200': { description: GitHub authorization URL and OAuth state cookies from Better Auth. }
+        '200': { description: Selected enabled provider authorization URL and OAuth state cookies from Better Auth. }
         '400': { $ref: '#/components/responses/Error' }
         '403': { $ref: '#/components/responses/Error' }
         '413': { $ref: '#/components/responses/Error' }
@@ -403,6 +415,164 @@ paths:
       responses:
         '200': { description: Authentication handler available. }
         '503': { $ref: '#/components/responses/Error' }
+  /v1/customer/session:
+    get:
+      operationId: readCustomerSession
+      security: [{ customerSession: [] }]
+      description: Verifies the customer signed cookie, current database session and persisted verified Google account. Merchant cookies, service bearer, guest identity and submitted role headers do not authorize this endpoint. Query parameters are rejected.
+      responses:
+        '200':
+          description: Safe customer identity. Private no-store; no email, provider subject or credentials.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerSession' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/customer/orders:
+    get:
+      operationId: listCustomerOrders
+      security: [{ customerSession: [] }]
+      description: Lists only orders owned by the authenticated customer, newest first by (created_at, id). Ownership comes from the original verified session at reservation; guest orders are never backfilled. Cursors preserve microseconds and convey no access. Unknown or duplicate query parameters are rejected. Resolved expired receipts are hidden; unresolved Stripe receipts remain retained.
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 512 }
+      responses:
+        '200':
+          description: Private order summaries with bounded keyset pagination. Uses the same safe projection as the merchant collection, restricted to this customer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantOrderPage' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /v1/customer/orders/{id}:
+    get:
+      operationId: readCustomerOrder
+      security: [{ customerSession: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      description: Read-only safe receipt projection for an order owned by the authenticated customer. No customer/guest IDs or provider credentials are returned. Missing, malformed, expired and other-owner IDs all return the same 404. Query parameters are rejected.
+      responses:
+        '200':
+          description: Retained customer-owned receipt. Private no-store.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/customer-auth/sign-in/social:
+    post:
+      operationId: startCustomerSignIn
+      security: []
+      description: Starts only Google redirect OAuth for a public shopper. Requires the exact configured storefront Origin and rejects cross-site/same-site Fetch metadata. Only openid/email/profile scopes are requested. The provider, success and error destinations are fixed; extra fields including raw ID tokens and requested scopes are rejected. JSON is bounded to 16 KiB. State, PKCE, database rate limits and session signing are library-managed.
+      parameters:
+        - name: Origin
+          in: header
+          required: true
+          schema: { type: string, format: uri }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider, callbackURL, errorCallbackURL]
+              properties:
+                provider: { const: google }
+                callbackURL: { const: /account }
+                errorCallbackURL: { const: /account/sign-in }
+      responses:
+        '200': { description: Google authorization URL and customer-only OAuth state cookies. }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '429': { description: Authentication rate limit exceeded. }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/customer-auth/callback/google:
+    get:
+      operationId: finishCustomerGoogleSignIn
+      security: []
+      description: Callback forwarded by the storefront BFF with customer OAuth state cookies. Requires one-time state, PKCE and library-verified Google ID-token signature, issuer, audience, expiry and state-bound nonce. Unverified Google email is rejected. Creates or signs into a customer identity keyed by Google subject; never creates or grants merchant access. Implicit account linking is disabled.
+      responses:
+        '302': { description: Redirect to the fixed customer success or error page with applicable state/session cookies. }
+        '400': { $ref: '#/components/responses/Error' }
+        '429': { description: Authentication rate limit exceeded. }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/customer-auth/sign-out:
+    post:
+      operationId: signOutCustomer
+      security: [{ customerSession: [] }]
+      description: Invalidates the current customer database session and clears its cookie. Merchant sessions remain separate. Requires the exact storefront Origin, an empty JSON object and no query parameters.
+      parameters:
+        - name: Origin
+          in: header
+          required: true
+          schema: { type: string, format: uri }
+      requestBody: { $ref: '#/components/requestBodies/EmptyObject' }
+      responses:
+        '200': { description: Customer session cleared. }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/customer-auth/ok:
+    get:
+      operationId: customerAuthHealth
+      security: []
+      description: Customer authentication readiness. Disabled or invalid configuration fails closed without affecting guest checkout. Does not prove Google consent or callback setup.
+      responses:
+        '200': { description: Customer authentication handler available. }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/auth/link-social:
+    post:
+      operationId: linkMerchantGoogleAccount
+      security: [{ merchantSession: [] }]
+      description: Starts explicit Google enrollment for an already authorized merchant. Both initiation and callback require the same live merchant session and current allowlisted GitHub binding. The callback validates Google signature, issuer, audience, expiry, nonce and verified email before linking the stable Google subject to that same merchant. Email matching alone never grants or links access. An existing different Google binding cannot be replaced by this operation.
+      parameters:
+        - name: Origin
+          in: header
+          required: true
+          schema: { type: string, format: uri }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider, callbackURL, errorCallbackURL]
+              properties:
+                provider: { const: google }
+                callbackURL: { const: /admin/orders }
+                errorCallbackURL: { const: /admin/sign-in }
+      responses:
+        '200': { description: Google authorization URL and merchant OAuth state cookies for explicit enrollment. }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+        '415': { $ref: '#/components/responses/Error' }
+        '429': { description: Link initiation rate limit exceeded. }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/auth/callback/google:
+    get:
+      operationId: finishMerchantGoogleSignIn
+      security: []
+      description: Completes enabled Google merchant sign-in or explicit enrollment using the same state/PKCE and verified ID-token checks as the shopper flow. Sign-in requires an existing linked Google subject whose merchant retains an approved GitHub identity; enrollment additionally requires the same live merchant session that initiated it. No public merchant signup or email-based implicit linking.
+      responses:
+        '302': { description: Redirect to the fixed merchant success or error page, with applicable state/session cookies. }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '429': { description: Authentication rate limit exceeded. }
+        '503': { $ref: '#/components/responses/Error' }
   /internal/cleanup:
     get:
       operationId: cleanupExpired
@@ -418,6 +588,9 @@ paths:
                 properties:
                   orders: { type: integer, minimum: 0 }
                   quotes: { type: integer, minimum: 0 }
+                  customerSessions: { type: integer, minimum: 0 }
+                  customerVerifications: { type: integer, minimum: 0 }
+                  customerRateLimits: { type: integer, minimum: 0 }
                   merchantSessions: { type: integer, minimum: 0 }
                   merchantVerifications: { type: integer, minimum: 0 }
                   merchantRateLimits: { type: integer, minimum: 0 }
@@ -438,11 +611,16 @@ paths:
                   status: { const: ok }
 components:
   securitySchemes:
+    customerSession:
+      type: apiKey
+      in: cookie
+      name: __Secure-joys_customer.session_token
+      description: Independent Better Auth signed HttpOnly customer cookie. Database-backed eight-hour session, verified Google account, no automatic extension. Local HTTP fixtures omit __Secure-. Never grants merchant access; service bearer and guest identity cannot replace it.
     merchantSession:
       type: apiKey
       in: cookie
       name: __Secure-joys_merchant.session_token
-      description: Better Auth signed HttpOnly cookie, validated against the backend database and explicit GitHub-ID allowlist. Local HTTP fixtures use the same name without __Secure-. Neither ORDERS_API_SECRET nor guest cookies grant merchant access.
+      description: Better Auth signed HttpOnly cookie, validated against the backend database and explicit GitHub-ID allowlist, including after a linked Google sign-in. Local HTTP fixtures use the same name without __Secure-. Neither ORDERS_API_SECRET nor guest cookies grant merchant access.
     serviceBearer:
       type: http
       scheme: bearer
@@ -457,6 +635,12 @@ components:
       scheme: bearer
       description: Separate CRON_SECRET. The checkout secret cannot authorize retention cleanup.
   parameters:
+    OptionalCustomerSession:
+      name: __Secure-joys_customer.session_token
+      in: cookie
+      required: false
+      description: Optional verified shopper session forwarded by the trusted storefront only on creation. The original account ownership (or guest null) is frozen with the order; account changes on a retry return 409 CUSTOMER_CHECKOUT_CHANGED. Expired or tampered cookies return 401 before reservation. The service bearer and guest header remain mandatory.
+      schema: { type: string }
     Guest:
       name: X-Guest-Id
       in: header
@@ -484,6 +668,19 @@ components:
             additionalProperties: false
             maxProperties: 0
   schemas:
+    CustomerSession:
+      type: object
+      additionalProperties: false
+      required: [user, role]
+      properties:
+        role: { const: customer }
+        user:
+          type: object
+          additionalProperties: false
+          required: [id, displayName]
+          properties:
+            id: { type: string, minLength: 1 }
+            displayName: { type: string, minLength: 1, maxLength: 80 }
     MerchantPaymentCheckStatus:
       type: string
       enum: [PENDING, PAID, CANCELED, REQUIRES_REVIEW]

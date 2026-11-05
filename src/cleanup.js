@@ -14,7 +14,11 @@ export async function cleanupExpired(pool, now = new Date()) {
     const sessions = await client.query('DELETE FROM merchant_sessions WHERE "expiresAt" <= $1', [now]);
     const verifications = await client.query('DELETE FROM merchant_verifications WHERE "expiresAt" <= $1', [now]);
     const rateLimits = await client.query('DELETE FROM merchant_rate_limits WHERE "lastRequest" <= $1', [now.getTime() - 86400000]);
+    const customerSessions = await client.query('DELETE FROM customer_sessions WHERE "expiresAt" <= $1', [now]);
+    const customerVerifications = await client.query('DELETE FROM customer_verifications WHERE "expiresAt" <= $1', [now]);
+    const customerRateLimits = await client.query('DELETE FROM customer_rate_limits WHERE "lastRequest" <= $1', [now.getTime() - 86400000]);
     return { orders: orders.rowCount, quotes: quotes.rowCount,
+      customerSessions: customerSessions.rowCount, customerVerifications: customerVerifications.rowCount, customerRateLimits: customerRateLimits.rowCount,
       merchantSessions: sessions.rowCount, merchantVerifications: verifications.rowCount, merchantRateLimits: rateLimits.rowCount };
   });
 }

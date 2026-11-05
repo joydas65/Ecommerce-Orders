@@ -6,6 +6,8 @@ import { stripeGatewayFromEnv } from './stripe-gateway.js';
 import { MerchantPaymentChecks } from './merchant-payment-checks.js';
 import { MerchantOrders } from './merchant-orders.js';
 import { createMerchantAuth } from './merchant-auth.js';
+import { createCustomerAuth } from './customer-auth.js';
+import { CustomerOrders } from './customer-orders.js';
 import { ApiError } from './errors.js';
 
 let runtime;
@@ -23,8 +25,16 @@ export function runtimeHandler(request, response) {
           return auth;
         } catch { throw new ApiError(503, 'MERCHANT_UNAVAILABLE', 'Merchant sign-in is temporarily unavailable.'); }
       };
+      let shopperAuth;
+      const customerAuth = () => {
+        try {
+          shopperAuth ||= createCustomerAuth({ pool });
+          if (!shopperAuth) throw new Error('Customer authentication disabled.');
+          return shopperAuth;
+        } catch { throw new ApiError(503, 'CUSTOMER_UNAVAILABLE', 'Account sign-in is temporarily unavailable.'); }
+      };
       const service = new OrderService(pool, { stripeGateway: stripeGatewayFromEnv() });
-      runtime = createHandler({ service, merchantPaymentChecks: new MerchantPaymentChecks(pool, { service }), merchantOrders: new MerchantOrders(pool), merchantAuth, authorizeMerchant: (request) => merchantAuth().authorize(request), secret: process.env.ORDERS_API_SECRET, cronSecret: process.env.CRON_SECRET, cleanup: () => cleanupExpired(pool) });
+      runtime = createHandler({ service, customerOrders: new CustomerOrders(pool), customerAuth, authorizeCustomer: (request) => customerAuth().authorize(request), merchantPaymentChecks: new MerchantPaymentChecks(pool, { service }), merchantOrders: new MerchantOrders(pool), merchantAuth, authorizeMerchant: (request) => merchantAuth().authorize(request), secret: process.env.ORDERS_API_SECRET, cronSecret: process.env.CRON_SECRET, cleanup: () => cleanupExpired(pool) });
     } catch {
       response.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'private, no-store' });
       response.end(JSON.stringify({ error: { code: 'SERVICE_UNAVAILABLE', message: 'Orders are temporarily unavailable.' } }));

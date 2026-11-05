@@ -32,16 +32,20 @@ export class OrderService {
     return quote;
   }
 
-  async reserveOrder(guest, input, idempotencyKey, provider) {
+  async reserveOrder(guest, input, idempotencyKey, provider, customerId = null) {
+    if (customerId !== null && (typeof customerId !== 'string' || !customerId || customerId.length > 255)) throw invalid();
     guest = guestIdentity(guest);
     const { quoteId, key } = submissionInput(input, idempotencyKey);
     const fingerprint = hash(`${provider}:${quoteId}`);
     return transaction(this.pool, async (client) => {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`${guest}:${key}`]);
-      const prior = await client.query('SELECT s.fingerprint, s.expires_at, o.receipt, o.payment_provider FROM order_submissions s JOIN orders o ON o.id = s.order_id WHERE s.guest_id = $1 AND s.idempotency_key = $2', [guest, key]);
+      const prior = await client.query('SELECT s.fingerprint, s.expires_at, o.receipt, o.payment_provider, o.customer_user_id FROM order_submissions s JOIN orders o ON o.id = s.order_id WHERE s.guest_id = $1 AND s.idempotency_key = $2', [guest, key]);
       let now = this.now();
       if (prior.rows[0]) {
         const previous = prior.rows[0];
+        // An idempotency replay cannot attach or transfer an existing order.
+        // The same shopper identity must finish the submission it began.
+        if (previous.customer_user_id !== customerId) throw new ApiError(409, 'CUSTOMER_CHECKOUT_CHANGED', 'Sign in with the account that started this checkout, or return to guest checkout to recover it.');
         if (previous.payment_provider !== provider) throw providerMismatch();
         const compatibleLegacy = provider === 'simulated' && previous.fingerprint === hash(quoteId);
         if (previous.fingerprint !== fingerprint && !compatibleLegacy) throw new ApiError(409, 'IDEMPOTENCY_CONFLICT', 'This submission key belongs to another checkout.');
@@ -63,7 +67,7 @@ export class OrderService {
         status: stripe ? 'PENDING_PAYMENT' : 'CONFIRMED', paymentStatus: stripe ? 'PENDING' : 'SIMULATED',
         createdAt: now.toISOString(), expiresAt: new Date(now.getTime() + orderLifetime).toISOString(), paymentProvider: provider,
         ...(stripe ? { paymentMode: 'test' } : {}) };
-      await client.query('INSERT INTO orders (id, quote_id, guest_id, receipt, expires_at, created_at, payment_provider) VALUES ($1, $2, $3, $4, $5, $6, $7)', [order.id, quoteId, guest, order, order.expiresAt, now, provider]);
+      await client.query('INSERT INTO orders (id, quote_id, guest_id, receipt, expires_at, created_at, payment_provider, customer_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)', [order.id, quoteId, guest, order, order.expiresAt, now, provider, customerId]);
       await client.query('INSERT INTO order_submissions (guest_id, idempotency_key, fingerprint, order_id, expires_at) VALUES ($1, $2, $3, $4, $5)', [guest, key, fingerprint, order.id, order.expiresAt]);
       if (stripe) await client.query('INSERT INTO payment_sessions (order_id, create_key, create_params, first_attempt_at) VALUES ($1, $2, $3, $4)',
         [order.id, `checkout:${order.id}`, this.stripe.params(order), now]);
@@ -71,7 +75,7 @@ export class OrderService {
     });
   }
 
-  createOrder(guest, input, key) { return this.reserveOrder(guest, input, key, 'simulated'); }
+  createOrder(guest, input, key, customerId = null) { return this.reserveOrder(guest, input, key, 'simulated', customerId); }
 
   async readOrder(guest, id) {
     guest = guestIdentity(guest);
@@ -81,9 +85,9 @@ export class OrderService {
     return result.rows[0].receipt;
   }
 
-  async createPaymentSession(guest, input, key) {
+  async createPaymentSession(guest, input, key, customerId = null) {
     this.requireStripe();
-    const reserved = await this.reserveOrder(guest, input, key, 'stripe-test');
+    const reserved = await this.reserveOrder(guest, input, key, 'stripe-test', customerId);
     return { ...await this.ensureSession(reserved.order.id), replayed: reserved.replayed };
   }
 

@@ -1,6 +1,6 @@
 import { after, before, test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { generateKeyPairSync, randomBytes, randomUUID, sign } from 'node:crypto';
 import pg from 'pg';
 import { getMigrations } from 'better-auth/db/migration';
 import { databaseConfig } from '../src/database.js';
@@ -210,5 +210,274 @@ test('sign out revokes the database session immediately', async () => {
 test('session seeding refuses Vercel, remote databases, and absent explicit opt-in', async () => {
   for (const override of [{ VERCEL: '1' }, { DATABASE_URL: 'postgres://user:pass@remote.example/orders' }, { MERCHANT_TEST_FIXTURES: '' }]) {
     await assert.rejects(seedMerchantSessions({ pool, env: { ...env, ...override } }), /fixtures require/i);
+  }
+});
+
+
+const googleCredentials = { MERCHANT_GOOGLE_ENABLED: 'true', GOOGLE_CLIENT_ID: 'fixture-google-client.apps.googleusercontent.com', GOOGLE_CLIENT_SECRET: 'fixture-google-secret-at-least-20' };
+const googleKeys = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const googleJwk = { ...googleKeys.publicKey.export({ format: 'jwk' }), kid: 'merchant-google-test', alg: 'RS256', use: 'sig' };
+
+async function googleFixture(extra = {}) {
+  const fixtureEnv = { ...env, ...googleCredentials, MERCHANT_GITHUB_IDS: `8${randomBytes(5).readUIntBE(0, 5)}`, MERCHANT_TEST_RUN_ID: randomUUID(), ...extra };
+  const seeded = await seedMerchantSessions({ pool, env: fixtureEnv });
+  return { env: fixtureEnv, auth: createMerchantAuth({ pool, env: fixtureEnv }), ...seeded };
+}
+
+let googleAttemptNumber = 100;
+async function beginGoogle(g, { link = true, cookie = link ? g.merchant.cookie : '', body = {}, ip = `192.0.2.${googleAttemptNumber++}` } = {}) {
+  const result = await g.auth.handler(new Request(`${g.auth.origin}/api/auth/${link ? 'link-social' : 'sign-in/social'}`, {
+    method: 'POST', headers: { origin: g.auth.origin, cookie, 'content-type': 'application/json', 'x-forwarded-for': ip },
+    body: JSON.stringify({ provider: 'google', callbackURL: '/admin/orders', errorCallbackURL: '/admin/sign-in', ...body }),
+  }));
+  assert.equal(result.status, 200, await result.clone().text());
+  const target = new URL((await result.json()).url);
+  assert.equal(target.origin, 'https://accounts.google.com');
+  assert.equal(target.pathname, '/o/oauth2/v2/auth');
+  assert.equal(target.searchParams.get('redirect_uri'), `${g.auth.origin}/api/auth/callback/google`);
+  assert.deepEqual(target.searchParams.get('scope').split(' ').sort(), ['email', 'openid', 'profile']);
+  assert.equal(target.searchParams.get('code_challenge_method'), 'S256');
+  assert.ok(target.searchParams.get('code_challenge'));
+  assert.equal(target.searchParams.get('access_type'), 'online');
+  assert.ok(target.searchParams.get('nonce'));
+  assert.equal(target.searchParams.get('include_granted_scopes'), null);
+  return { state: target.searchParams.get('state'), nonce: target.searchParams.get('nonce'), cookies: result.headers.getSetCookie().map((value) => value.split(';')[0]).join('; '), cookie };
+}
+
+function signedGoogleToken(attempt, { sub = `google-${randomUUID()}`, email = 'approved-google@example.test', verified = true, claims = {}, badSignature = false } = {}) {
+  const payload = { iss: 'https://accounts.google.com', aud: googleCredentials.GOOGLE_CLIENT_ID, sub, email, email_verified: verified, name: 'Google merchant', iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 300, ...(attempt.nonce ? { nonce: attempt.nonce } : {}), ...claims };
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const unsigned = `${encode({ alg: 'RS256', kid: googleJwk.kid, typ: 'JWT' })}.${encode(payload)}`;
+  const signature = sign('RSA-SHA256', Buffer.from(unsigned), googleKeys.privateKey).toString('base64url');
+  const idToken = `${unsigned}.${badSignature ? `${signature[0] === 'a' ? 'b' : 'a'}${signature.slice(1)}` : signature}`;
+  return { idToken, sub };
+}
+
+function mockGoogle(attempt, options) {
+  const { idToken, sub } = signedGoogleToken(attempt, options);
+  const requests = [];
+  const provider = mock.method(globalThis, 'fetch', async (input, options) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    requests.push({ url, body: options?.body });
+    if (url === 'https://oauth2.googleapis.com/token') return Response.json({ access_token: 'fixture-google-access-token', id_token: idToken, token_type: 'Bearer', expires_in: 300, scope: 'openid email profile' });
+    if (url === 'https://www.googleapis.com/oauth2/v3/certs') return Response.json({ keys: [googleJwk] });
+    throw new Error(`Unexpected provider request: ${new URL(url).origin}`);
+  });
+  return { provider, requests, sub };
+}
+
+function finishGoogle(g, attempt, cookie = attempt.cookie, code = 'fixture-code') {
+  return g.auth.handler(new Request(`${g.auth.origin}/api/auth/callback/google?code=${encodeURIComponent(code)}&state=${encodeURIComponent(attempt.state)}`, {
+    headers: { cookie: [attempt.cookies, cookie].filter(Boolean).join('; '), 'x-forwarded-for': '192.0.2.201' },
+  }));
+}
+
+async function linkGoogle(g, options) {
+  const attempt = await beginGoogle(g);
+  const fixture = mockGoogle(attempt, options);
+  try {
+    const response = await finishGoogle(g, attempt);
+    assert.equal(response.status, 302);
+    assert.equal(new URL(response.headers.get('location'), g.auth.origin).href, `${g.auth.origin}/admin/orders`);
+    return { sub: fixture.sub, attempt };
+  } finally { fixture.provider.mock.restore(); }
+}
+
+test('Google is optional and its enabled configuration validates credentials without changing GitHub requirements', () => {
+  assert.deepEqual(createMerchantAuth({ pool, env }).enabledProviders, ['github']);
+  assert.equal(merchantAuthOptions(pool, merchantAuthConfiguration(env)).account.accountLinking.enabled, false);
+  const config = merchantAuthConfiguration({ ...env, ...googleCredentials });
+  assert.equal(config.google.clientId, googleCredentials.GOOGLE_CLIENT_ID);
+  assert.deepEqual(createMerchantAuth({ pool, env: { ...env, ...googleCredentials } }).enabledProviders, ['github', 'google']);
+  for (const extra of [{ GOOGLE_CLIENT_ID: '' }, { GOOGLE_CLIENT_ID: 'not-google' }, { GOOGLE_CLIENT_SECRET: '' }, { MERCHANT_GITHUB_IDS: '' }]) assert.throws(() => merchantAuthConfiguration({ ...env, ...googleCredentials, ...extra }));
+  const options = merchantAuthOptions(pool, config);
+  assert.equal(options.socialProviders.google.disableSignUp, true);
+  assert.equal(options.account.accountLinking.disableImplicitLinking, true);
+  assert.equal(options.account.accountLinking.allowDifferentEmails, true);
+});
+
+test('Google linking requires a live authorized merchant cookie, exact origin, and a bounded provider-only request', async () => {
+  const g = await googleFixture();
+  for (const [cookie, expected] of [['', 401], [g.ordinary.cookie, 403], [g.expiredCookie, 401], [g.merchant.cookie.replace('joys_merchant.', 'joys_customer.'), 401]]) {
+    const response = await g.auth.handler(new Request(`${g.auth.origin}/api/auth/link-social`, {
+      method: 'POST', headers: { origin: g.auth.origin, cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'google', callbackURL: '/admin/orders', errorCallbackURL: '/admin/sign-in' }),
+    }));
+    assert.equal(response.status, expected);
+  }
+  for (const extra of [{ provider: 'github' }, { scopes: ['https://www.googleapis.com/auth/drive'] }, { idToken: { token: 'untrusted' } }, { callbackURL: 'https://attacker.example' }]) {
+    const response = await g.auth.handler(new Request(`${g.auth.origin}/api/auth/link-social`, {
+      method: 'POST', headers: { origin: g.auth.origin, cookie: g.merchant.cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'google', callbackURL: '/admin/orders', errorCallbackURL: '/admin/sign-in', ...extra }),
+    }));
+    assert.equal(response.status, 400);
+  }
+  for (const changed of [{ origin: 'https://attacker.example' }, { 'sec-fetch-site': 'same-site' }, { 'sec-fetch-site': 'cross-site' }]) {
+    const response = await g.auth.handler(new Request(`${g.auth.origin}/api/auth/link-social`, {
+      method: 'POST', headers: { origin: g.auth.origin, cookie: g.merchant.cookie, 'content-type': 'application/json', ...changed },
+      body: JSON.stringify({ provider: 'google', callbackURL: '/admin/orders', errorCallbackURL: '/admin/sign-in' }),
+    }));
+    assert.equal(response.status, 403);
+  }
+});
+
+test('explicit verified Google linking preserves the merchant identity and allows a different email without implicit linking', async () => {
+  const g = await googleFixture();
+  const before = (await pool.query('SELECT id,email FROM merchant_users WHERE id=$1', [g.merchant.userId])).rows[0];
+  assert.deepEqual(await g.auth.accountStatus(asRequest(g.merchant.cookie)), { googleEnabled: true, googleLinked: false });
+  const { sub } = await linkGoogle(g, { email: 'different-google-email@example.test' });
+  assert.deepEqual((await pool.query('SELECT id,email FROM merchant_users WHERE id=$1', [g.merchant.userId])).rows[0], before);
+  const accounts = (await pool.query('SELECT "userId","accountId","accessToken" FROM merchant_accounts WHERE "providerId"=$1 AND "accountId"=$2', ['google', sub])).rows;
+  assert.equal(accounts.length, 1);
+  assert.equal(accounts[0].userId, g.merchant.userId);
+  assert.notEqual(accounts[0].accessToken, 'fixture-google-access-token');
+  assert.deepEqual(await g.auth.accountStatus(asRequest(g.merchant.cookie)), { googleEnabled: true, googleLinked: true });
+});
+
+test('Google sign-in accepts only an explicitly linked identity and retains the stable merchant audit actor', async () => {
+  const g = await googleFixture();
+  const { sub } = await linkGoogle(g);
+  const attempt = await beginGoogle(g, { link: false });
+  const fixture = mockGoogle(attempt, { sub });
+  try {
+    const response = await finishGoogle(g, attempt);
+    assert.equal(response.status, 302);
+    assert.equal(new URL(response.headers.get('location'), g.auth.origin).href, `${g.auth.origin}/admin/orders`);
+    const cookie = response.headers.getSetCookie().find((value) => value.startsWith('joys_merchant.session_token=')).split(';')[0];
+    assert.deepEqual(await g.auth.authorize(asRequest(cookie)), { userId: g.merchant.userId, role: 'merchant' });
+    const revoked = createMerchantAuth({ pool, env: { ...g.env, MERCHANT_GITHUB_IDS: '12345678' } });
+    await assert.rejects(revoked.authorize(asRequest(cookie)), hasCode('MERCHANT_FORBIDDEN'));
+  } finally { fixture.provider.mock.restore(); }
+});
+
+test('Google sign-in never creates a merchant or links by matching an existing merchant email', async () => {
+  const g = await googleFixture();
+  const email = (await pool.query('SELECT email FROM merchant_users WHERE id=$1', [g.merchant.userId])).rows[0].email;
+  for (const candidate of [email, 'unknown-google-user@example.test']) {
+    const attempt = await beginGoogle(g, { link: false });
+    const fixture = mockGoogle(attempt, { email: candidate });
+    try {
+      const response = await finishGoogle(g, attempt);
+      assert.match(response.headers.get('location'), /error=/);
+      assert.equal((await pool.query('SELECT count(*)::int count FROM merchant_accounts WHERE "providerId"=$1 AND "accountId"=$2', ['google', fixture.sub])).rows[0].count, 0);
+    } finally { fixture.provider.mock.restore(); }
+  }
+});
+
+test('Google linking fails if the merchant session disappears or switches users during OAuth', async () => {
+  const g = await googleFixture();
+  for (const cookie of ['', g.ordinary.cookie, g.expiredCookie]) {
+    const attempt = await beginGoogle(g);
+    const fixture = mockGoogle(attempt);
+    try {
+      const response = await finishGoogle(g, attempt, cookie);
+      assert.match(response.headers.get('location'), /error=/);
+      assert.equal((await pool.query('SELECT count(*)::int count FROM merchant_accounts WHERE "providerId"=$1 AND "accountId"=$2', ['google', fixture.sub])).rows[0].count, 0);
+    } finally { fixture.provider.mock.restore(); }
+  }
+});
+
+test('GitHub approval revocation during OAuth prevents Google binding and future Google sign-in', async () => {
+  const g = await googleFixture();
+  const attempt = await beginGoogle(g);
+  const fixture = mockGoogle(attempt);
+  const revoked = { ...g, auth: createMerchantAuth({ pool, env: { ...g.env, MERCHANT_GITHUB_IDS: '12345678' } }) };
+  try {
+    const response = await finishGoogle(revoked, attempt);
+    assert.match(response.headers.get('location'), /error=/);
+    assert.equal((await pool.query('SELECT count(*)::int count FROM merchant_accounts WHERE "providerId"=$1 AND "accountId"=$2', ['google', fixture.sub])).rows[0].count, 0);
+  } finally { fixture.provider.mock.restore(); }
+  const { sub } = await linkGoogle(g);
+  const login = await beginGoogle(revoked, { link: false });
+  const provider = mockGoogle(login, { sub });
+  try { assert.match((await finishGoogle(revoked, login)).headers.get('location'), /error=/); }
+  finally { provider.provider.mock.restore(); }
+});
+
+test('a Google identity already linked to another merchant cannot be reassigned', async () => {
+  const first = await googleFixture();
+  const second = await googleFixture();
+  const { sub } = await linkGoogle(first);
+  const attempt = await beginGoogle(second);
+  const fixture = mockGoogle(attempt, { sub });
+  try {
+    const response = await finishGoogle(second, attempt);
+    assert.match(response.headers.get('location'), /error=/);
+    assert.equal((await pool.query('SELECT "userId" FROM merchant_accounts WHERE "providerId"=$1 AND "accountId"=$2', ['google', sub])).rows[0].userId, first.merchant.userId);
+  } finally { fixture.provider.mock.restore(); }
+});
+
+test('Google linking verifies ID token signature, issuer, audience, nonce and verified email before persistence', async () => {
+  const g = await googleFixture();
+  for (const invalid of [{ badSignature: true }, { claims: { iss: 'https://attacker.example' } }, { claims: { aud: 'another-client' } }, { claims: { nonce: 'wrong-nonce' } }, { verified: false }]) {
+    const attempt = await beginGoogle(g);
+    const fixture = mockGoogle(attempt, invalid);
+    try {
+      const response = await finishGoogle(g, attempt);
+      assert.match(response.headers.get('location'), /error=/);
+      assert.equal((await pool.query('SELECT count(*)::int count FROM merchant_accounts WHERE "providerId"=$1 AND "accountId"=$2', ['google', fixture.sub])).rows[0].count, 0);
+    } finally { fixture.provider.mock.restore(); }
+  }
+});
+
+test('Google linking OAuth state requires its signed cookie and cannot be replayed', async () => {
+  const g = await googleFixture();
+  const { attempt } = await linkGoogle(g);
+  const replay = await finishGoogle(g, attempt);
+  assert.match(replay.headers.get('location'), /error=state_mismatch|error=state_invalid|error=invalid_state/);
+  const missing = await beginGoogle(g);
+  assert.match((await finishGoogle(g, { ...missing, cookies: '' })).headers.get('location'), /error=/);
+});
+
+
+test('simultaneous explicit Google callbacks bind one identity and preserve the same merchant', async () => {
+  const g = await googleFixture();
+  const attempts = await Promise.all([beginGoogle(g), beginGoogle(g)]);
+  const tokens = attempts.map((attempt) => signedGoogleToken(attempt));
+  const provider = mock.method(globalThis, 'fetch', async (input, options) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (url === 'https://www.googleapis.com/oauth2/v3/certs') return Response.json({ keys: [googleJwk] });
+    if (url === 'https://oauth2.googleapis.com/token') {
+      const index = new URLSearchParams(options?.body).get('code') === 'concurrent-first' ? 0 : 1;
+      return Response.json({ access_token: 'fixture-google-access-token', id_token: tokens[index].idToken, token_type: 'Bearer', expires_in: 300, scope: 'openid email profile' });
+    }
+    throw new Error(`Unexpected provider request: ${new URL(url).origin}`);
+  });
+  // Force both callbacks to observe no Google binding before either inserts.
+  // This demonstrates the database invariant rather than relying on scheduling.
+  const query = pool.query.bind(pool);
+  let arrivals = 0;
+  let release;
+  const barrier = new Promise((resolve) => { release = resolve; });
+  const deadline = setTimeout(release, 2000);
+  const errorLogs = mock.method(console, 'error', () => {});
+  const queries = mock.method(pool, 'query', async (sql, values, ...rest) => {
+    const result = await query(sql, values, ...rest);
+    if (sql === 'SELECT "accountId" FROM merchant_accounts WHERE "userId" = $1 AND "providerId" = $2'
+      && values[0] === g.merchant.userId && values[1] === 'google') {
+      arrivals += 1;
+      if (arrivals === 2) release();
+      await barrier;
+    }
+    return result;
+  });
+  try {
+    const responses = await Promise.all(attempts.map((attempt, index) => finishGoogle(g, attempt, attempt.cookie, index === 0 ? 'concurrent-first' : 'concurrent-second')));
+    assert.equal(arrivals, 2);
+    assert.equal(responses.filter((response) => response.status === 302 && response.headers.get('location') === '/admin/orders').length, 1);
+    assert.equal(responses.filter((response) => response.status === 302 && response.headers.get('location') === '/admin/sign-in?error=merchant_google_already_linked').length, 1);
+    assert.equal(errorLogs.mock.callCount(), 0, 'Database identities and errors must not enter auth logs');
+    const bound = (await query('SELECT "accountId", "userId" FROM merchant_accounts WHERE "userId" = $1 AND "providerId" = $2', [g.merchant.userId, 'google'])).rows;
+    assert.equal(bound.length, 1);
+    assert.equal(bound[0].userId, g.merchant.userId);
+    assert.ok(tokens.some((token) => token.sub === bound[0].accountId));
+    assert.deepEqual(await g.auth.authorize(asRequest(g.merchant.cookie)), { userId: g.merchant.userId, role: 'merchant' });
+    assert.equal((await query('SELECT count(*)::int count FROM merchant_users WHERE id = $1', [g.merchant.userId])).rows[0].count, 1);
+  } finally {
+    clearTimeout(deadline);
+    release();
+    queries.mock.restore();
+    errorLogs.mock.restore();
+    provider.mock.restore();
   }
 });
